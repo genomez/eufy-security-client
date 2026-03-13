@@ -30,6 +30,7 @@ export enum DeviceType {
   BATTERY_DOORBELL_2 = 16,
   HB3 = 18,
   CAMERA3 = 19,
+  WATER_FREEZE_SENSOR_8920 = 20,
   CAMERA3C = 23,
   PROFESSIONAL_247 = 24, // T8600
   MINIBASE_CHIME = 25,
@@ -992,6 +993,7 @@ export const GenericTypeProperty: PropertyMetadataNumeric = {
     16: "Battery Doorbell 2",
     18: "HomeBase S380 (HomeBase 3; T8030)",
     19: "eufyCam S330 (eufyCam 3)",
+    20: "eufy Water and Freeze Sensor T8920",
     23: "eufyCam S300 (eufyCam 3C)",
     24: "eufyCam E330 (Professional)",
     25: "MiniBase Chime",
@@ -8701,6 +8703,14 @@ export const DeviceProperties: Properties = {
     [PropertyName.DeviceSnooze]: DeviceSnoozeProperty,
     [PropertyName.DeviceState]: DeviceStateProperty,
     [PropertyName.DeviceBattery]: DeviceBatteryProperty,
+    [PropertyName.DeviceBatteryLow]: DeviceBatteryLowMotionSensorProperty,
+  },
+  [DeviceType.WATER_FREEZE_SENSOR_8920]: {
+    ...GenericDeviceProperties,
+    [PropertyName.DeviceState]: DeviceStateProperty,
+    [PropertyName.DeviceBattery]: DeviceBatteryProperty,
+    [PropertyName.DeviceSnooze]: DeviceSnoozeProperty,
+    [PropertyName.DeviceWifiRSSI]: DeviceWifiRSSIEntrySensorProperty,
     [PropertyName.DeviceBatteryLow]: DeviceBatteryLowMotionSensorProperty,
   },
 };
