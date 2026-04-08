@@ -828,6 +828,10 @@ export class Station extends TypedEmitter<StationEvents> {
     return sn.startsWith("T8025");
   }
 
+  public static isStationHomeBaseProfessionalS1BySn(sn: string): boolean {
+    return sn.startsWith("T9000");
+  }
+
   public isStationHomeBase2OrOlder(): boolean {
     return Station.isStationHomeBase2OrOlder(this.rawStation.device_type);
   }
@@ -841,20 +845,28 @@ export class Station extends TypedEmitter<StationEvents> {
   }
 
   /**
-   * Checks if the station is a HomeBase 3 or HomeBase mini for determining if SoloDevices are connected to a supported HomeBase.
-   * @returns Returns true, if this is a HomeBase 3 or a HomeBase mini, otherwise false.
+   * Checks if the station is a HomeBase 3, HomeBase mini, or HomeBase Professional S1 for determining if SoloDevices are connected to a supported HomeBase.
+   * @returns Returns true, if this is a HomeBase 3, HomeBase mini, or HomeBase Professional S1, otherwise false.
    */
   public isDeviceControlledByHomeBase(): boolean {
-    return this.isStationHomeBase3() || this.isStationHomeBaseMini();
+    return (
+      this.isStationHomeBase3() ||
+      this.isStationHomeBaseMini() ||
+      Station.isStationHomeBaseProfessionalS1BySn(this.getSerial())
+    );
   }
 
   /**
-   * Checks if the station is a HomeBase 3 or HomeBase mini for determining if SoloDevices are connected to a supported HomeBase The check will be done by the given serial number.
+   * Checks if the station is a HomeBase 3, HomeBase mini, or HomeBase Professional S1 for determining if SoloDevices are connected to a supported HomeBase. The check will be done by the given serial number.
    * @param sn The serial of the station to check.
-   * @returns Returns true, if this is a HomeBase 3 or a HomeBase mini, otherwise false.
+   * @returns Returns true, if this is a HomeBase 3, HomeBase mini, or HomeBase Professional S1, otherwise false.
    */
   public static isDeviceControlledByHomeBaseBySn(sn: string): boolean {
-    return Station.isStationHomeBase3BySn(sn) || Station.isStationHomeBaseMiniBySn(sn);
+    return (
+      Station.isStationHomeBase3BySn(sn) ||
+      Station.isStationHomeBaseMiniBySn(sn) ||
+      Station.isStationHomeBaseProfessionalS1BySn(sn)
+    );
   }
 
   public isIntegratedDevice(): boolean {
