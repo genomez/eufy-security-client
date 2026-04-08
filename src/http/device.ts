@@ -1170,7 +1170,7 @@ export class Device extends TypedEmitter<DeviceEvents> {
           property.name === PropertyName.DeviceMotionDetectionTypePet ||
           property.name === PropertyName.DeviceMotionDetectionTypeVehicle ||
           property.name === PropertyName.DeviceMotionDetectionTypeAllOtherMotions) &&
-        this.getStationSerial().startsWith("T8030")
+        Station.isDeviceControlledByHomeBaseBySn(this.getStationSerial())
       ) {
         const booleanProperty = property as PropertyMetadataBoolean;
         try {
@@ -3543,6 +3543,29 @@ export class SoloCamera extends Camera {
                   this.updateProperty(PropertyName.DevicePersonName, "");
                   this.updateProperty(PropertyName.DevicePersonDetected, false);
                   this.eventTimeouts.delete(DeviceEvent.PersonDetected);
+                }, eventDurationSeconds * 1000)
+              );
+
+              if (this.config.simultaneousDetections) {
+                this.updateProperty(PropertyName.DeviceMotionDetected, true);
+                this.clearEventTimeout(DeviceEvent.MotionDetected);
+                this.eventTimeouts.set(
+                  DeviceEvent.MotionDetected,
+                  setTimeout(async () => {
+                    this.updateProperty(PropertyName.DeviceMotionDetected, false);
+                    this.eventTimeouts.delete(DeviceEvent.MotionDetected);
+                  }, eventDurationSeconds * 1000)
+                );
+              }
+              break;
+            case IndoorPushEvent.VEHICLE_DETECTION:
+              this.updateProperty(PropertyName.DeviceVehicleDetected, true);
+              this.clearEventTimeout(DeviceEvent.VehicleDetected);
+              this.eventTimeouts.set(
+                DeviceEvent.VehicleDetected,
+                setTimeout(async () => {
+                  this.updateProperty(PropertyName.DeviceVehicleDetected, false);
+                  this.eventTimeouts.delete(DeviceEvent.VehicleDetected);
                 }, eventDurationSeconds * 1000)
               );
 
