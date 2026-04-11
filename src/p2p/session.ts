@@ -4451,7 +4451,16 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
   }
 
   public updateRawStation(value: StationListResponse): void {
+    const prevAppConn = this.rawStation?.app_conn;
     this.rawStation = value;
+
+    if (value.app_conn !== prevAppConn) {
+      this.cloudAddresses = decodeP2PCloudIPs(value.app_conn ?? "");
+      rootP2PLogger.debug(`P2P cloud addresses refreshed from station data`, {
+        stationSN: value.station_sn,
+        addressCount: this.cloudAddresses.length,
+      });
+    }
 
     this.channel = Station.getChannel(value.device_type);
 

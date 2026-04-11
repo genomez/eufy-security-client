@@ -702,18 +702,32 @@ export const decodeP2PCloudIPs = (data: string): Array<Address> => {
     "hex"
   );
 
-  const [encoded, name = "name not included"] = data.split(":");
-  const output = Buffer.alloc(encoded.length / 2);
+  if (data === undefined || data === null || data === "") {
+    return [];
+  }
 
-  for (let i = 0; i <= data.length / 2; i++) {
+  // Only the segment before ":" is the obfuscated IP list; the rest is metadata.
+  // Using the full string was wrong and could corrupt decoding or walk past the buffer.
+  const encoded = data.split(":")[0] ?? "";
+  if (encoded.length < 2) {
+    rootP2PLogger.warn(`decodeP2PCloudIPs: app_conn too short to decode`, {
+      appConnPrefix: data.substring(0, Math.min(120, data.length)),
+    });
+    return [];
+  }
+
+  const pairCount = Math.floor(encoded.length / 2);
+  const output = Buffer.alloc(pairCount);
+
+  for (let i = 0; i < pairCount; i++) {
     let z = 0x39; // 57 // '9'
 
     for (let j = 0; j < i; j++) {
       z = z ^ output[j];
     }
 
-    const x = data.charCodeAt(i * 2 + 1) - "A".charCodeAt(0);
-    const y = (data.charCodeAt(i * 2) - "A".charCodeAt(0)) * 0x10;
+    const x = encoded.charCodeAt(i * 2 + 1) - "A".charCodeAt(0);
+    const y = (encoded.charCodeAt(i * 2) - "A".charCodeAt(0)) * 0x10;
     output[i] = z ^ lookupTable[i % lookupTable.length] ^ (x + y);
   }
 
@@ -726,6 +740,13 @@ export const decodeP2PCloudIPs = (data: string): Array<Address> => {
         result.push({ host: ip, port: 32100 });
       }
     });
+
+  if (result.length === 0 && data.length > 0) {
+    rootP2PLogger.warn(`decodeP2PCloudIPs: decoded zero cloud addresses`, {
+      appConnPrefix: data.substring(0, Math.min(120, data.length)),
+    });
+  }
+
   return result;
 };
 
