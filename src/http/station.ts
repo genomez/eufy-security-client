@@ -799,6 +799,7 @@ export class Station extends TypedEmitter<StationEvents> {
     return (
       type === DeviceType.STATION ||
       type === DeviceType.HB3 ||
+      type === DeviceType.HOMEBASE_PROFESSIONAL_S1 ||
       type === DeviceType.MINIBASE_CHIME ||
       type === DeviceType.HOMEBASE_MINI
     );
@@ -1174,7 +1175,8 @@ export class Station extends TypedEmitter<StationEvents> {
       (isGreaterEqualMinVersion("2.0.7.9", this.getSoftwareVersion()) &&
         !Device.isIntegratedDeviceBySn(this.getSerial())) ||
       Device.isSoloCameraBySn(this.getSerial()) ||
-      this.rawStation.device_type === DeviceType.HB3
+      this.rawStation.device_type === DeviceType.HB3 ||
+      this.rawStation.device_type === DeviceType.HOMEBASE_PROFESSIONAL_S1
     ) {
       rootHTTPLogger.debug(`Station set guard mode - Using CMD_SET_PAYLOAD`, {
         stationSN: this.getSerial(),
@@ -1232,12 +1234,14 @@ export class Station extends TypedEmitter<StationEvents> {
     if (
       this.isStation() &&
       this.rawStation.device_type !== DeviceType.HB3 &&
+      this.rawStation.device_type !== DeviceType.HOMEBASE_PROFESSIONAL_S1 &&
       this.rawStation.device_type !== DeviceType.HOMEBASE_MINI &&
       isGreaterEqualMinVersion("3.2.7.6", this.getSoftwareVersion())
     ) {
       this.p2pSession.sendCommandWithoutData(CommandType.CMD_SDINFO_EX, Station.CHANNEL);
     } else if (
       this.rawStation.device_type === DeviceType.HB3 ||
+      this.rawStation.device_type === DeviceType.HOMEBASE_PROFESSIONAL_S1 ||
       this.rawStation.device_type === DeviceType.HOMEBASE_MINI
     ) {
       this.p2pSession.sendCommandWithStringPayload({
@@ -1421,11 +1425,17 @@ export class Station extends TypedEmitter<StationEvents> {
     if (
       channel === Station.CHANNEL ||
       channel === Station.CHANNEL_INDOOR ||
-      (this.isIntegratedDevice() && this.getDeviceType() !== DeviceType.HB3)
+      (this.isIntegratedDevice() &&
+        this.getDeviceType() !== DeviceType.HB3 &&
+        this.getDeviceType() !== DeviceType.HOMEBASE_PROFESSIONAL_S1)
     ) {
       this.updateRawProperty(type, value, "p2p");
       if (type === CommandType.CMD_GET_ALARM_MODE) {
-        if (this.getDeviceType() !== DeviceType.STATION && this.getDeviceType() !== DeviceType.HB3)
+        if (
+          this.getDeviceType() !== DeviceType.STATION &&
+          this.getDeviceType() !== DeviceType.HB3 &&
+          this.getDeviceType() !== DeviceType.HOMEBASE_PROFESSIONAL_S1
+        )
           // Trigger refresh Guard Mode
           this.api.refreshStationData();
       }

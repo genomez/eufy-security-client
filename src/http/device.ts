@@ -1986,6 +1986,7 @@ export class Device extends TypedEmitter<DeviceEvents> {
     return (
       type === DeviceType.STATION ||
       type === DeviceType.HB3 ||
+      type === DeviceType.HOMEBASE_PROFESSIONAL_S1 ||
       type === DeviceType.HOMEBASE_MINI ||
       type === DeviceType.MINIBASE_CHIME
     );
