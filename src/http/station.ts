@@ -754,9 +754,15 @@ export class Station extends TypedEmitter<StationEvents> {
       ...StationProperties[this.getDeviceType()],
     };
     if (Object.keys(metadata).length === 0) {
-      metadata = {
-        ...BaseStationProperties,
-      };
+      if (this.isStationHomeBaseProfessionalS1()) {
+        metadata = {
+          ...StationProperties[DeviceType.HB3],
+        };
+      } else {
+        metadata = {
+          ...BaseStationProperties,
+        };
+      }
     }
     if (this.hasDeviceWithType(DeviceType.KEYPAD)) {
       metadata[PropertyName.StationGuardMode] = StationGuardModeKeyPadProperty;
@@ -779,7 +785,12 @@ export class Station extends TypedEmitter<StationEvents> {
 
   public getCommands(): Array<CommandName> {
     const commands = StationCommands[this.getDeviceType()];
-    if (commands === undefined) return [];
+    if (commands === undefined) {
+      if (this.isStationHomeBaseProfessionalS1()) {
+        return StationCommands[DeviceType.HB3] ?? [];
+      }
+      return [];
+    }
     return commands;
   }
 
@@ -806,7 +817,7 @@ export class Station extends TypedEmitter<StationEvents> {
   }
 
   public isStation(): boolean {
-    return Station.isStation(this.rawStation.device_type);
+    return Station.isStation(this.rawStation.device_type) || this.isStationHomeBaseProfessionalS1();
   }
 
   public static isStationHomeBase2OrOlder(type: number): boolean {
@@ -845,22 +856,26 @@ export class Station extends TypedEmitter<StationEvents> {
     return Station.isStationHomeBaseMini(this.rawStation.device_type);
   }
 
+  public isStationHomeBaseProfessionalS1(): boolean {
+    return Station.isStationHomeBaseProfessionalS1BySn(this.getSerial());
+  }
+
   /**
-   * Checks if the station is a HomeBase 3, HomeBase mini or HomeBase Pro S1 for determining if SoloDevices are connected to a supported HomeBase.
-   * @returns Returns true, if this is a HomeBase 3, a HomeBase mini or a HomeBase Pro S1, otherwise false.
+   * Checks if the station is a HomeBase 3, HomeBase mini, or HomeBase Professional S1 for determining if SoloDevices are connected to a supported HomeBase.
+   * @returns Returns true, if this is a HomeBase 3, HomeBase mini, or HomeBase Professional S1, otherwise false.
    */
   public isDeviceControlledByHomeBase(): boolean {
     return (
       this.isStationHomeBase3() ||
       this.isStationHomeBaseMini() ||
-      Station.isStationHomeBaseProfessionalS1BySn(this.getSerial())
+      this.isStationHomeBaseProfessionalS1()
     );
   }
 
   /**
-   * Checks if the station is a HomeBase 3, HomeBase mini or HomeBase Pro S1 for determining if SoloDevices are connected to a supported HomeBase. The check will be done by the given serial number.
+   * Checks if the station is a HomeBase 3, HomeBase mini, or HomeBase Professional S1 for determining if SoloDevices are connected to a supported HomeBase. The check will be done by the given serial number.
    * @param sn The serial of the station to check.
-   * @returns Returns true, if this is a HomeBase 3, a HomeBase mini or a HomeBase Pro S1, otherwise false.
+   * @returns Returns true, if this is a HomeBase 3, HomeBase mini, or HomeBase Professional S1, otherwise false.
    */
   public static isDeviceControlledByHomeBaseBySn(sn: string): boolean {
     return (
@@ -1176,7 +1191,8 @@ export class Station extends TypedEmitter<StationEvents> {
         !Device.isIntegratedDeviceBySn(this.getSerial())) ||
       Device.isSoloCameraBySn(this.getSerial()) ||
       this.rawStation.device_type === DeviceType.HB3 ||
-      this.rawStation.device_type === DeviceType.HOMEBASE_PROFESSIONAL_S1
+      this.rawStation.device_type === DeviceType.HOMEBASE_PROFESSIONAL_S1 ||
+      this.isStationHomeBaseProfessionalS1()
     ) {
       rootHTTPLogger.debug(`Station set guard mode - Using CMD_SET_PAYLOAD`, {
         stationSN: this.getSerial(),
@@ -1236,13 +1252,15 @@ export class Station extends TypedEmitter<StationEvents> {
       this.rawStation.device_type !== DeviceType.HB3 &&
       this.rawStation.device_type !== DeviceType.HOMEBASE_PROFESSIONAL_S1 &&
       this.rawStation.device_type !== DeviceType.HOMEBASE_MINI &&
+      !this.isStationHomeBaseProfessionalS1() &&
       isGreaterEqualMinVersion("3.2.7.6", this.getSoftwareVersion())
     ) {
       this.p2pSession.sendCommandWithoutData(CommandType.CMD_SDINFO_EX, Station.CHANNEL);
     } else if (
       this.rawStation.device_type === DeviceType.HB3 ||
       this.rawStation.device_type === DeviceType.HOMEBASE_PROFESSIONAL_S1 ||
-      this.rawStation.device_type === DeviceType.HOMEBASE_MINI
+      this.rawStation.device_type === DeviceType.HOMEBASE_MINI ||
+      this.isStationHomeBaseProfessionalS1()
     ) {
       this.p2pSession.sendCommandWithStringPayload({
         commandType: CommandType.CMD_SET_PAYLOAD,
@@ -1434,7 +1452,7 @@ export class Station extends TypedEmitter<StationEvents> {
         if (
           this.getDeviceType() !== DeviceType.STATION &&
           this.getDeviceType() !== DeviceType.HB3 &&
-          this.getDeviceType() !== DeviceType.HOMEBASE_PROFESSIONAL_S1
+          !this.isStationHomeBaseProfessionalS1()
         )
           // Trigger refresh Guard Mode
           this.api.refreshStationData();
@@ -3144,7 +3162,7 @@ export class Station extends TypedEmitter<StationEvents> {
       type: type,
       value: value,
     });
-    if (this.getDeviceType() === DeviceType.HB3) {
+    if (this.getDeviceType() === DeviceType.HB3 || this.isStationHomeBaseProfessionalS1()) {
       try {
         if (!Object.values(HB3DetectionTypes).includes(type as HB3DetectionTypes)) {
           rootHTTPLogger.error(
@@ -7489,7 +7507,7 @@ export class Station extends TypedEmitter<StationEvents> {
       path: path,
       cipherID: cipher_id,
     });
-    if (this.getDeviceType() === DeviceType.HB3) {
+    if (this.getDeviceType() === DeviceType.HB3 || this.isStationHomeBaseProfessionalS1()) {
       //TODO: Implement HB3 Support! Actually doesn't work and returns return_code -104 (ERROR_INVALID_ACCOUNT). It could be that we need the new encrypted p2p protocol to make this work...
       const rsa_key = this.p2pSession.getDownloadRSAPrivateKey();
       this.p2pSession.sendCommandWithStringPayload(
