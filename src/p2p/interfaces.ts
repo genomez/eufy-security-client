@@ -4,6 +4,8 @@ import { SortedMap } from "sweet-collections";
 
 import { AlarmMode, DeviceType, MicStatus, ParamType, TriggerType, VideoType } from "../http/types";
 import { Address, CmdCameraInfoResponse, CommandResult, CustomData, StorageInfoBodyHB3 } from "./models";
+import { HomeBaseS1VideoMotionEvent } from "./homebaseS1Grid";
+import { PushMessage } from "../push/models";
 import { TalkbackStream } from "./talkback";
 import {
   AlarmEvent,
@@ -68,8 +70,16 @@ export interface P2PClientProtocolEvents {
   "sensor status": (channel: number, status: number) => void;
   "garage door status": (channel: number, doorId: number, status: number) => void;
   "storage info hb3": (channel: number, storageInfo: StorageInfoBodyHB3) => void;
+  "push notification": (message: PushMessage) => void;
   "sequence error": (channel: number, command: number, sequence: number, serialnumber: string) => void;
   "hub notify update": () => void;
+  "device video state": (
+    channel: number,
+    deviceSn: string,
+    curVideoState: number,
+    previousVideoState: number | undefined,
+    motionEvent: HomeBaseS1VideoMotionEvent
+  ) => void;
 }
 
 export interface P2PQueueMessage {

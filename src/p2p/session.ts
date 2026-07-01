@@ -25,6 +25,13 @@ import {
   SmartLockP2PSequenceData,
 } from "./models";
 import {
+  applyHomeBaseS1MotionLatch,
+  extractGridDeviceVideoStates,
+  getHomeBaseS1VideoMotionEvent,
+  HOME_BASE_S1_GRID_MOTION_ENABLED,
+  HomeBaseS1GridNotifyPayload,
+} from "./homebaseS1Grid";
+import {
   sendMessage,
   hasHeader,
   buildCheckCamPayload,
@@ -128,7 +135,7 @@ import { ParsePayload, decodeImage } from "../http/utils";
 import { TalkbackStream } from "./talkback";
 import { LivestreamError, TalkbackError, ensureError } from "../error";
 import { SmartSafeEvent } from "../push/types";
-import { SmartSafeEventValueDetail } from "../push/models";
+import { PushMessage, SmartSafeEventValueDetail } from "../push/models";
 import { BleCommandFactory, BleParameterIndex } from "./ble";
 import { CommandName, ParamType, Station } from "../http";
 import { getError, parseJSON } from "../utils";
@@ -194,6 +201,8 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
   private offsetDataSeqNumber = 0;
   private videoSeqNumber = 0;
   private lockSeqNumber = -1;
+  private deviceVideoStates = new Map<string, number>();
+  private deviceGridMotionActive = new Map<string, boolean>();
   private expectedSeqNo: {
     [dataType: number]: number;
   } = {};
@@ -3654,6 +3663,61 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
                   }
                 );
                 this.emit("hub notify update");
+              } else if (
+                Number(json.cmd) === CommandType.CMD_STATION_PUSH_NOTIFY ||
+                Number(json.cmd) === CommandType.CMD_STATION_PUSH_NOTIFY_ALT
+              ) {
+                const outerPayload = json.payload as { payload?: string; station_sn?: string };
+                if (typeof outerPayload?.payload === "string") {
+                  const innerPayload = parseJSON(
+                    Buffer.from(outerPayload.payload, "base64").toString("utf8"),
+                    rootP2PLogger
+                  ) as PushMessage;
+                  if (innerPayload !== undefined) {
+                    rootP2PLogger.info("P2P station push notification received", {
+                      stationSN: this.rawStation.station_sn,
+                      commandId: json.cmd,
+                      event_type: innerPayload.event_type,
+                      device_sn: innerPayload.device_sn,
+                    });
+                    this.emit("push notification", {
+                      ...innerPayload,
+                      type: innerPayload.msg_type,
+                      station_sn: innerPayload.station_sn ?? outerPayload.station_sn ?? this.rawStation.station_sn,
+                      person_name:
+                        innerPayload.person_name ??
+                        (innerPayload as PushMessage & { nick_name?: string }).nick_name,
+                    } as PushMessage);
+                  }
+                }
+              } else if (Number(json.cmd) === CommandType.CMD_CAMERA_PUSH_NOTIFY) {
+                const innerPayload = parseJSON(
+                  typeof json.payload === "string" ? json.payload : JSON.stringify(json.payload),
+                  rootP2PLogger
+                ) as PushMessage;
+                if (innerPayload !== undefined) {
+                  rootP2PLogger.info("P2P camera push notification received", {
+                    stationSN: this.rawStation.station_sn,
+                    event_type: innerPayload.event_type,
+                    device_sn: innerPayload.device_sn,
+                  });
+                  this.emit("push notification", {
+                    ...innerPayload,
+                    type: innerPayload.msg_type,
+                    station_sn: this.rawStation.station_sn,
+                    person_name:
+                      innerPayload.person_name ??
+                      (innerPayload as PushMessage & { nick_name?: string }).nick_name,
+                  } as PushMessage);
+                }
+              } else if (
+                Number(json.cmd) === CommandType.CMD_HOME_BASE_S1_GRID_UPDATE &&
+                Station.isStationHomeBaseProfessionalS1BySn(this.rawStation.station_sn)
+              ) {
+                this.handleHomeBaseS1GridUpdate(
+                  message.channel,
+                  json.payload as HomeBaseS1GridNotifyPayload
+                );
               } else {
                 rootP2PLogger.debug(
                   `Handle DATA ${P2PDataType[message.dataType]} - CMD_NOTIFY_PAYLOAD - Not implemented 2`,
@@ -4581,7 +4645,16 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
   }
 
   public updateRawStation(value: StationListResponse): void {
+    const prevAppConn = this.rawStation?.app_conn;
     this.rawStation = value;
+
+    if (value.app_conn !== prevAppConn) {
+      this.cloudAddresses = decodeP2PCloudIPs(value.app_conn ?? "");
+      rootP2PLogger.debug(`P2P cloud addresses refreshed from station data`, {
+        stationSN: value.station_sn,
+        addressCount: this.cloudAddresses.length,
+      });
+    }
 
     this.channel = Station.getChannel(value.device_type);
 
@@ -4713,6 +4786,44 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
 
   public getLockAESKey(commandCode: number): string | undefined {
     return this.lockAESKeys.get(commandCode);
+  }
+
+  private handleHomeBaseS1GridUpdate(channel: number, payload: HomeBaseS1GridNotifyPayload): void {
+    if (!HOME_BASE_S1_GRID_MOTION_ENABLED) {
+      return;
+    }
+    const devices = extractGridDeviceVideoStates(payload);
+    if (devices.length === 0) {
+      rootP2PLogger.debug("CMD_HOME_BASE_S1_GRID_UPDATE without dev_list video states", {
+        stationSN: this.rawStation.station_sn,
+      });
+      return;
+    }
+    for (const { sn, channel: deviceChannel, curVideoState } of devices) {
+      const previousVideoState = this.deviceVideoStates.get(sn);
+      this.deviceVideoStates.set(sn, curVideoState);
+      const motionEvent = applyHomeBaseS1MotionLatch(
+        this.deviceGridMotionActive,
+        sn,
+        getHomeBaseS1VideoMotionEvent(previousVideoState, curVideoState)
+      );
+      if (motionEvent === "none") {
+        continue;
+      }
+      const logPayload = {
+        stationSN: this.rawStation.station_sn,
+        deviceSN: sn,
+        previousVideoState,
+        curVideoState,
+        motionEvent,
+      };
+      if (motionEvent === "start") {
+        rootP2PLogger.info("T9000 grid video state motion", logPayload);
+      } else {
+        rootP2PLogger.debug("T9000 grid video state motion", logPayload);
+      }
+      this.emit("device video state", deviceChannel || channel, sn, curVideoState, previousVideoState, motionEvent);
+    }
   }
 
   public isConnecting(): boolean {
