@@ -102,10 +102,12 @@ import {
   isSmartLockNotification,
   isT8170DetectionModeEnabled,
   loadEventImage,
+  loadImageOverP2P,
   WritePayload,
   isT8110DetectionModeEnabled,
 } from "./utils";
 import { DecimalToRGBColor, eslTimestamp, getCurrentTimeInSeconds, isCharging } from "../p2p/utils";
+import { HomeBaseS1VideoMotionEvent } from "../p2p/homebaseS1Grid";
 import {
   CusPushEvent,
   DoorbellPushEvent,
@@ -1173,7 +1175,7 @@ export class Device extends TypedEmitter<DeviceEvents> {
           property.name === PropertyName.DeviceMotionDetectionTypePet ||
           property.name === PropertyName.DeviceMotionDetectionTypeVehicle ||
           property.name === PropertyName.DeviceMotionDetectionTypeAllOtherMotions) &&
-        this.getStationSerial().startsWith("T8030")
+        Station.isDeviceControlledByHomeBaseBySn(this.getStationSerial())
       ) {
         const booleanProperty = property as PropertyMetadataBoolean;
         try {
@@ -2001,6 +2003,7 @@ export class Device extends TypedEmitter<DeviceEvents> {
     return (
       type === DeviceType.STATION ||
       type === DeviceType.HB3 ||
+      type === DeviceType.HOMEBASE_PROFESSIONAL_S1 ||
       type === DeviceType.HOMEBASE_MINI ||
       type === DeviceType.MINIBASE_CHIME ||
       type === DeviceType.NVR_S4_MAX
@@ -3205,6 +3208,31 @@ export class Camera extends Device {
     return this.getPropertyValue(PropertyName.DeviceMotionDetected) as boolean;
   }
 
+  /**
+   * Motion from T9000 HomeBase S1 grid updates when FCM push is unavailable.
+   */
+  public processHomeBaseS1VideoStateChange(
+    station: Station,
+    motionEvent: HomeBaseS1VideoMotionEvent,
+    eventDurationSeconds: number
+  ): void {
+    if (motionEvent === "start") {
+      loadImageOverP2P(station, this, this.getSerial(), this.pictureEventTimeouts);
+      this.updateProperty(PropertyName.DeviceMotionDetected, true);
+      this.clearEventTimeout(DeviceEvent.MotionDetected);
+      this.eventTimeouts.set(
+        DeviceEvent.MotionDetected,
+        setTimeout(async () => {
+          this.updateProperty(PropertyName.DeviceMotionDetected, false);
+          this.eventTimeouts.delete(DeviceEvent.MotionDetected);
+        }, eventDurationSeconds * 1000)
+      );
+    } else if (motionEvent === "end") {
+      this.clearEventTimeout(DeviceEvent.MotionDetected);
+      this.updateProperty(PropertyName.DeviceMotionDetected, false);
+    }
+  }
+
   public isPersonDetected(): boolean {
     return this.getPropertyValue(PropertyName.DevicePersonDetected) as boolean;
   }
@@ -3607,6 +3635,29 @@ export class SoloCamera extends Camera {
                   this.updateProperty(PropertyName.DevicePersonName, "");
                   this.updateProperty(PropertyName.DevicePersonDetected, false);
                   this.eventTimeouts.delete(DeviceEvent.PersonDetected);
+                }, eventDurationSeconds * 1000)
+              );
+
+              if (this.config.simultaneousDetections) {
+                this.updateProperty(PropertyName.DeviceMotionDetected, true);
+                this.clearEventTimeout(DeviceEvent.MotionDetected);
+                this.eventTimeouts.set(
+                  DeviceEvent.MotionDetected,
+                  setTimeout(async () => {
+                    this.updateProperty(PropertyName.DeviceMotionDetected, false);
+                    this.eventTimeouts.delete(DeviceEvent.MotionDetected);
+                  }, eventDurationSeconds * 1000)
+                );
+              }
+              break;
+            case IndoorPushEvent.VEHICLE_DETECTION:
+              this.updateProperty(PropertyName.DeviceVehicleDetected, true);
+              this.clearEventTimeout(DeviceEvent.VehicleDetected);
+              this.eventTimeouts.set(
+                DeviceEvent.VehicleDetected,
+                setTimeout(async () => {
+                  this.updateProperty(PropertyName.DeviceVehicleDetected, false);
+                  this.eventTimeouts.delete(DeviceEvent.VehicleDetected);
                 }, eventDurationSeconds * 1000)
               );
 

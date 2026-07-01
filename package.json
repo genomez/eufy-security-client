@@ -17,6 +17,7 @@
     "copy-proto-build": "npx copyfiles -u 1 \"src/**/*.proto\" \"src/**/*.crt\" build",
     "test": "jest --coverage",
     "test:watch": "jest --watch",
+    "prepare": "npm run build",
     "build": "npm run build:ts",
     "watch:ts": "tsc -p tsconfig.build.json --watch",
     "watch": "npm run watch:ts",

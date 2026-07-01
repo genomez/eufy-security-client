@@ -560,7 +560,8 @@ export class PushNotificationService extends TypedEmitter<PushNotificationServic
 
         if (
           Station.isStationHomeBase3(normalizedMessage.type) ||
-          (normalizedMessage.station_sn.startsWith("T8030") && Device.isCamera(normalizedMessage.type))
+          (Station.isDeviceControlledByHomeBaseBySn(normalizedMessage.station_sn) &&
+            Device.isCamera(normalizedMessage.type))
         ) {
           const platformPushData = payload.payload as PlatformPushMode;
           normalizedMessage.name = platformPushData.name ? platformPushData.name : "";

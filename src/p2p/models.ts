@@ -1,6 +1,7 @@
 import { PropertyValue } from "../http";
 import { CommandName, PropertyName } from "../http/types";
 import { SmartSafeEventValueDetail } from "../push/models";
+import { HomeBaseS1GridNotifyPayload } from "./homebaseS1Grid";
 import { CommandType } from "./types";
 
 export interface Address {
@@ -59,6 +60,7 @@ export interface CmdNotifyPayload {
     | GarageDoorStatus
     | StorageInfoHB3
     | SmartLockP2PSequenceData
+    | HomeBaseS1GridNotifyPayload
     | string;
   payloadLen?: number;
 }

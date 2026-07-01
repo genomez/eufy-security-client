@@ -99,6 +99,7 @@ import {
   StreamMetadata,
   StreamTimeoutOptions,
 } from "../p2p/interfaces";
+import { HomeBaseS1VideoMotionEvent } from "../p2p/homebaseS1Grid";
 import { P2PClientProtocol } from "../p2p/session";
 import {
   AlarmEvent,
@@ -293,6 +294,17 @@ export class Station extends TypedEmitter<StationEvents> {
       this.onSequenceError(channel, command, sequence, serialnumber)
     );
     this.p2pSession.on("hub notify update", () => this.onHubNotifyUpdate());
+    this.p2pSession.on("push notification", (message: PushMessage) => this.onPushNotification(message));
+    this.p2pSession.on(
+      "device video state",
+      (
+        channel: number,
+        deviceSn: string,
+        curVideoState: number,
+        previousVideoState: number | undefined,
+        motionEvent: HomeBaseS1VideoMotionEvent
+      ) => this.onDeviceVideoState(channel, deviceSn, curVideoState, previousVideoState, motionEvent)
+    );
   }
 
   protected initializeState(): void {
@@ -754,9 +766,15 @@ export class Station extends TypedEmitter<StationEvents> {
       ...StationProperties[this.getDeviceType()],
     };
     if (Object.keys(metadata).length === 0) {
-      metadata = {
-        ...BaseStationProperties,
-      };
+      if (this.isStationHomeBaseProfessionalS1()) {
+        metadata = {
+          ...StationProperties[DeviceType.HB3],
+        };
+      } else {
+        metadata = {
+          ...BaseStationProperties,
+        };
+      }
     }
     if (this.hasDeviceWithType(DeviceType.KEYPAD)) {
       metadata[PropertyName.StationGuardMode] = StationGuardModeKeyPadProperty;
@@ -779,7 +797,12 @@ export class Station extends TypedEmitter<StationEvents> {
 
   public getCommands(): Array<CommandName> {
     const commands = StationCommands[this.getDeviceType()];
-    if (commands === undefined) return [];
+    if (commands === undefined) {
+      if (this.isStationHomeBaseProfessionalS1()) {
+        return StationCommands[DeviceType.HB3] ?? [];
+      }
+      return [];
+    }
     return commands;
   }
 
@@ -799,6 +822,7 @@ export class Station extends TypedEmitter<StationEvents> {
     return (
       type === DeviceType.STATION ||
       type === DeviceType.HB3 ||
+      type === DeviceType.HOMEBASE_PROFESSIONAL_S1 ||
       type === DeviceType.MINIBASE_CHIME ||
       type === DeviceType.HOMEBASE_MINI ||
       type === DeviceType.NVR_S4_MAX
@@ -806,7 +830,7 @@ export class Station extends TypedEmitter<StationEvents> {
   }
 
   public isStation(): boolean {
-    return Station.isStation(this.rawStation.device_type);
+    return Station.isStation(this.rawStation.device_type) || this.isStationHomeBaseProfessionalS1();
   }
 
   public static isStationHomeBase2OrOlder(type: number): boolean {
@@ -833,6 +857,10 @@ export class Station extends TypedEmitter<StationEvents> {
     return sn.startsWith("T8025");
   }
 
+  public static isStationHomeBaseProfessionalS1BySn(sn: string): boolean {
+    return sn.startsWith("T9000");
+  }
+
   public static isStationMiniBaseChime(type: number): boolean {
     return type === DeviceType.MINIBASE_CHIME;
   }
@@ -857,6 +885,10 @@ export class Station extends TypedEmitter<StationEvents> {
     return Station.isStationHomeBaseMini(this.rawStation.device_type);
   }
 
+  public isStationHomeBaseProfessionalS1(): boolean {
+    return Station.isStationHomeBaseProfessionalS1BySn(this.getSerial());
+  }
+
   public isStationMiniBaseChime(): boolean {
     return Station.isStationMiniBaseChime(this.rawStation.device_type);
   }
@@ -866,20 +898,28 @@ export class Station extends TypedEmitter<StationEvents> {
   }
 
   /**
-   * Checks if the station is a HomeBase 3 or HomeBase mini for determining if SoloDevices are connected to a supported HomeBase.
-   * @returns Returns true, if this is a HomeBase 3 or a HomeBase mini, otherwise false.
+   * Checks if the station is a HomeBase 3, HomeBase mini, or HomeBase Professional S1 for determining if SoloDevices are connected to a supported HomeBase.
+   * @returns Returns true, if this is a HomeBase 3, HomeBase mini, or HomeBase Professional S1, otherwise false.
    */
   public isDeviceControlledByHomeBase(): boolean {
-    return this.isStationHomeBase3() || this.isStationHomeBaseMini();
+    return (
+      this.isStationHomeBase3() ||
+      this.isStationHomeBaseMini() ||
+      this.isStationHomeBaseProfessionalS1()
+    );
   }
 
   /**
-   * Checks if the station is a HomeBase 3 or HomeBase mini for determining if SoloDevices are connected to a supported HomeBase The check will be done by the given serial number.
+   * Checks if the station is a HomeBase 3, HomeBase mini, or HomeBase Professional S1 for determining if SoloDevices are connected to a supported HomeBase. The check will be done by the given serial number.
    * @param sn The serial of the station to check.
-   * @returns Returns true, if this is a HomeBase 3 or a HomeBase mini, otherwise false.
+   * @returns Returns true, if this is a HomeBase 3, HomeBase mini, or HomeBase Professional S1, otherwise false.
    */
   public static isDeviceControlledByHomeBaseBySn(sn: string): boolean {
-    return Station.isStationHomeBase3BySn(sn) || Station.isStationHomeBaseMiniBySn(sn);
+    return (
+      Station.isStationHomeBase3BySn(sn) ||
+      Station.isStationHomeBaseMiniBySn(sn) ||
+      Station.isStationHomeBaseProfessionalS1BySn(sn)
+    );
   }
 
   public isIntegratedDevice(): boolean {
@@ -1187,7 +1227,9 @@ export class Station extends TypedEmitter<StationEvents> {
       (isGreaterEqualMinVersion("2.0.7.9", this.getSoftwareVersion()) &&
         !Device.isIntegratedDeviceBySn(this.getSerial())) ||
       Device.isSoloCameraBySn(this.getSerial()) ||
-      this.rawStation.device_type === DeviceType.HB3
+      this.rawStation.device_type === DeviceType.HB3 ||
+      this.rawStation.device_type === DeviceType.HOMEBASE_PROFESSIONAL_S1 ||
+      this.isStationHomeBaseProfessionalS1()
     ) {
       rootHTTPLogger.debug(`Station set guard mode - Using CMD_SET_PAYLOAD`, {
         stationSN: this.getSerial(),
@@ -1245,13 +1287,17 @@ export class Station extends TypedEmitter<StationEvents> {
     if (
       this.isStation() &&
       this.rawStation.device_type !== DeviceType.HB3 &&
+      this.rawStation.device_type !== DeviceType.HOMEBASE_PROFESSIONAL_S1 &&
       this.rawStation.device_type !== DeviceType.HOMEBASE_MINI &&
+      !this.isStationHomeBaseProfessionalS1() &&
       isGreaterEqualMinVersion("3.2.7.6", this.getSoftwareVersion())
     ) {
       this.p2pSession.sendCommandWithoutData(CommandType.CMD_SDINFO_EX, Station.CHANNEL);
     } else if (
       this.rawStation.device_type === DeviceType.HB3 ||
-      this.rawStation.device_type === DeviceType.HOMEBASE_MINI
+      this.rawStation.device_type === DeviceType.HOMEBASE_PROFESSIONAL_S1 ||
+      this.rawStation.device_type === DeviceType.HOMEBASE_MINI ||
+      this.isStationHomeBaseProfessionalS1()
     ) {
       this.p2pSession.sendCommandWithStringPayload({
         commandType: CommandType.CMD_SET_PAYLOAD,
@@ -1434,11 +1480,17 @@ export class Station extends TypedEmitter<StationEvents> {
     if (
       channel === Station.CHANNEL ||
       channel === Station.CHANNEL_INDOOR ||
-      (this.isIntegratedDevice() && this.getDeviceType() !== DeviceType.HB3)
+      (this.isIntegratedDevice() &&
+        this.getDeviceType() !== DeviceType.HB3 &&
+        this.getDeviceType() !== DeviceType.HOMEBASE_PROFESSIONAL_S1)
     ) {
       this.updateRawProperty(type, value, "p2p");
       if (type === CommandType.CMD_GET_ALARM_MODE) {
-        if (this.getDeviceType() !== DeviceType.STATION && this.getDeviceType() !== DeviceType.HB3)
+        if (
+          this.getDeviceType() !== DeviceType.STATION &&
+          this.getDeviceType() !== DeviceType.HB3 &&
+          !this.isStationHomeBaseProfessionalS1()
+        )
           // Trigger refresh Guard Mode
           this.api.refreshStationData();
       }
@@ -3147,7 +3199,7 @@ export class Station extends TypedEmitter<StationEvents> {
       type: type,
       value: value,
     });
-    if (this.getDeviceType() === DeviceType.HB3) {
+    if (this.getDeviceType() === DeviceType.HB3 || this.isStationHomeBaseProfessionalS1()) {
       try {
         if (!Object.values(HB3DetectionTypes).includes(type as HB3DetectionTypes)) {
           rootHTTPLogger.error(
@@ -7517,7 +7569,7 @@ export class Station extends TypedEmitter<StationEvents> {
       path: path,
       cipherID: cipher_id,
     });
-    if (this.getDeviceType() === DeviceType.HB3) {
+    if (this.getDeviceType() === DeviceType.HB3 || this.isStationHomeBaseProfessionalS1()) {
       //TODO: Implement HB3 Support! Actually doesn't work and returns return_code -104 (ERROR_INVALID_ACCOUNT). It could be that we need the new encrypted p2p protocol to make this work...
       const rsa_key = this.p2pSession.getDownloadRSAPrivateKey();
       this.p2pSession.sendCommandWithStringPayload(
@@ -18067,6 +18119,20 @@ export class Station extends TypedEmitter<StationEvents> {
 
   private onHubNotifyUpdate(): void {
     this.emit("hub notify update", this);
+  }
+
+  private onPushNotification(message: PushMessage): void {
+    this.emit("push notification", this, message);
+  }
+
+  private onDeviceVideoState(
+    channel: number,
+    deviceSn: string,
+    curVideoState: number,
+    previousVideoState: number | undefined,
+    motionEvent: HomeBaseS1VideoMotionEvent
+  ): void {
+    this.emit("device video state", this, channel, deviceSn, curVideoState, previousVideoState, motionEvent);
   }
 
   public updateUsername(device: Device, username: string, passwordId: string): void {
