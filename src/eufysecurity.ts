@@ -7,6 +7,7 @@ import EventEmitter from "events";
 
 import { EufySecurityEvents, EufySecurityConfig, EufySecurityPersistentData } from "./interfaces";
 import { HTTPApi } from "./http/api";
+import { MegaHTTPApi, megaLoginHash } from "./http/megaApi";
 import {
   Devices,
   FullDevices,
@@ -33,6 +34,7 @@ import {
   NotificationSwitchMode,
   NotificationType,
   PropertyName,
+  ResponseErrorCode,
   SoloCameraDetectionTypes,
   T8170DetectionTypes,
   UserPasswordType,
@@ -82,6 +84,7 @@ import {
   MotionZone,
   CrossTrackingGroupEntry,
 } from "./p2p/interfaces";
+import { HomeBaseS1VideoMotionEvent } from "./p2p/homebaseS1Grid";
 import { CommandResult, StorageInfoBodyHB3 } from "./p2p/models";
 import {
   generateSerialnumber,
@@ -128,6 +131,7 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
   private config: EufySecurityConfig;
 
   private api!: HTTPApi;
+  private megaApi?: MegaHTTPApi;
 
   private houses: Houses = {};
   private stations: Stations = {};
@@ -375,6 +379,7 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
     this.pushService.on("connect", async (token: string) => {
       this.pushCloudRegistered = await this.api.registerPushToken(token);
       this.pushCloudChecked = await this.api.checkPushToken();
+      await this.registerMegaPushToken(token);
       //TODO: Retry if failed with max retry to not lock account
 
       if (this.pushCloudRegistered && this.pushCloudChecked) {
@@ -395,6 +400,71 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
     });
 
     await this.initMQTT();
+  }
+
+  /**
+   * Register the FCM token on the v6 "eufy_mega" backend, best-effort.
+   *
+   * Reuses a persisted {@link MegaSession} (token valid ~30 days) so no extra login/2FA is needed
+   * on normal startups. If there is no valid v6 session yet, this no-ops with a log — the legacy
+   * push registration already ran, so behaviour is unchanged for not-yet-migrated accounts. The
+   * first-time v6 login (which may need 2FA) is intentionally NOT forced here to avoid surprise
+   * 2FA prompts / account lockouts; it is performed explicitly via {@link loginMega}.
+   */
+  private async getMegaApi(): Promise<MegaHTTPApi> {
+    if (!this.megaApi) {
+      this.megaApi = new MegaHTTPApi({
+        ab: this.config.country ?? "US",
+        osType: "android",
+        phoneModel: this.config.trustedDeviceName,
+        openudid: this.persistentData.openudid || undefined,
+      });
+      await this.megaApi.init();
+      const saved = this.persistentData.megaApi;
+      if (saved) {
+        const currentHash = megaLoginHash(this.config.username, this.config.password, this.persistentData.openudid);
+        if (saved.login_hash && saved.login_hash !== currentHash) {
+          rootMainLogger.debug("v6: credentials changed since last login, ignoring stored mega session");
+        } else {
+          this.megaApi.restoreSession(saved);
+        }
+      }
+    }
+    return this.megaApi;
+  }
+
+  private async syncMegaPushRegistration(): Promise<void> {
+    try {
+      const pushService = this.pushService;
+      if (!pushService?.isConnected()) return;
+      const token = pushService.getCredentials()?.gcmResponse?.token;
+      if (token) await this.registerMegaPushToken(token);
+    } catch (err) {
+      rootMainLogger.warn("v6 push: mega FCM re-registration skipped", {
+        error: getError(ensureError(err)),
+      });
+    }
+  }
+
+  private async registerMegaPushToken(token: string): Promise<void> {
+    try {
+      await this.getMegaApi();
+      if (!this.megaApi!.hasValidSession()) {
+        rootMainLogger.debug("v6 push: no valid mega session yet, skipping register (legacy still active)");
+        return;
+      }
+      const result = await this.megaApi!.registerPushToken(token);
+      if (result.code === 0) {
+        rootMainLogger.info("v6 push: FCM token registered on the eufy_mega backend");
+      } else {
+        rootMainLogger.warn("v6 push: register_push_token returned a non-zero code", {
+          code: result.code,
+          msg: result.msg,
+        });
+      }
+    } catch (err) {
+      rootMainLogger.warn("v6 push: register failed (legacy push unaffected)", { error: getError(ensureError(err)) });
+    }
   }
 
   private async initMQTT(): Promise<void> {
@@ -791,6 +861,28 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
                 this.onStorageInfoHb3(station, channel, storageInfo)
               );
               station.on("hub notify update", (station: Station) => this.onHubNotifyUpdate(station));
+              station.on("push notification", (_station: Station, message: PushMessage) =>
+                this.onPushMessage(message)
+              );
+              station.on(
+                "device video state",
+                (
+                  station: Station,
+                  channel: number,
+                  deviceSn: string,
+                  curVideoState: number,
+                  previousVideoState: number | undefined,
+                  motionEvent: HomeBaseS1VideoMotionEvent
+                ) =>
+                  this.onStationDeviceVideoState(
+                    station,
+                    channel,
+                    deviceSn,
+                    curVideoState,
+                    previousVideoState,
+                    motionEvent
+                  )
+              );
               this.addStation(station);
               station.initialize();
             } catch (err) {
@@ -865,6 +957,54 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
       stationSN: station.getSerial(),
     });
     this.refreshCloudData();
+  }
+
+  private onStationDeviceVideoState(
+    station: Station,
+    channel: number,
+    deviceSn: string,
+    curVideoState: number,
+    previousVideoState: number | undefined,
+    motionEvent: HomeBaseS1VideoMotionEvent
+  ): void {
+    this.getDevice(deviceSn)
+      .then((device: Device) => {
+        if (!Device.isCamera(device.getDeviceType())) {
+          return;
+        }
+        if (motionEvent === "start") {
+          rootMainLogger.info("HomeBase S1 grid motion detected", {
+            stationSN: station.getSerial(),
+            deviceSN: deviceSn,
+            curVideoState,
+            previousVideoState,
+          });
+        } else {
+          rootMainLogger.debug("HomeBase S1 grid video state motion", {
+            stationSN: station.getSerial(),
+            deviceSN: deviceSn,
+            channel,
+            curVideoState,
+            previousVideoState,
+            motionEvent,
+          });
+        }
+        (device as Camera).processHomeBaseS1VideoStateChange(station, motionEvent, this.config.eventDurationSeconds);
+      })
+      .catch((err) => {
+        const error = ensureError(err);
+        if (!(error instanceof DeviceNotFoundError)) {
+          rootMainLogger.error("HomeBase S1 grid video state motion error", {
+            error: getError(error),
+            stationSN: station.getSerial(),
+            deviceSN: deviceSn,
+            channel,
+            curVideoState,
+            previousVideoState,
+            motionEvent,
+          });
+        }
+      });
   }
 
   private onStationConnectionError(station: Station, error: Error): void {
@@ -1177,6 +1317,88 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
         const error = ensureError(err);
         rootMainLogger.error("Connect Error", { error: getError(error), options: options });
       });
+  }
+
+  /**
+   * Authenticate against the v6 "eufy_mega" backend so the FCM token can be registered there
+   * (required to receive events on migrated accounts). Opt-in / explicit because the very
+   * first login may trigger email 2FA.
+   *
+   * Mirrors the legacy 2FA/captcha UX:
+   *  1. `loginMega()` — on `26052` triggers the email code and returns "tfa_required"; on a captcha
+   *     challenge it emits "captcha request" and returns "captcha_required".
+   *  2. `loginMega(code)` / `loginMega(undefined, captcha)` — completes login; the session is
+   *     persisted (token ~30 days) so later startups reuse it with no relogin/2FA.
+   *
+   * The backend (not the client) enforces lockout: it returns CODE_PASSWORD_TOO_MANY_INCORRECT /
+   * CODE_PASSWORD_WRONG_FIVE_TIMES / CODE_MAX_LOGIN_LIMIT. Those are surfaced as "locked" so the
+   * caller stops retrying instead of hammering the endpoint (which deepens the lockout).
+   *
+   * @returns "ok" | "tfa_required" | "captcha_required" | "locked" | "failed"
+   */
+  public async loginMega(
+    verifyCode?: string,
+    captcha?: { captchaId: string; answer: string }
+  ): Promise<"ok" | "tfa_required" | "captcha_required" | "locked" | "failed"> {
+    try {
+      const mega = await this.getMegaApi();
+      if (mega.hasValidSession() && !verifyCode && !captcha) {
+        try {
+          await this.syncMegaPushRegistration();
+        } catch {
+          // push may not be initialized yet (e.g. during isolated loginMega tests)
+        }
+        return "ok";
+      }
+
+      await mega.estimateDomain();
+      await mega.keyExchange(mega.clusterHost("openapi"));
+      const result = await mega.login(this.config.username!, this.config.password!, verifyCode, captcha);
+
+      if (result.code === ResponseErrorCode.CODE_NEED_VERIFY_CODE) {
+        await mega.sendVerifyCode();
+        rootMainLogger.info("v6 login: email 2FA required — call loginMega(code) with the received code");
+        return "tfa_required";
+      }
+      if (
+        result.code === ResponseErrorCode.LOGIN_NEED_CAPTCHA ||
+        result.code === ResponseErrorCode.LOGIN_CAPTCHA_ERROR
+      ) {
+        const c = await mega.generateCaptcha();
+        this.emit("captcha request", c.captcha_id, c.item);
+        rootMainLogger.info("v6 login: captcha required — call loginMega(undefined, {captchaId, answer})");
+        return "captcha_required";
+      }
+      if (
+        result.code === ResponseErrorCode.CODE_PASSWORD_TOO_MANY_INCORRECT ||
+        result.code === ResponseErrorCode.CODE_PASSWORD_WRONG_FIVE_TIMES ||
+        result.code === ResponseErrorCode.CODE_MAX_LOGIN_LIMIT
+      ) {
+        rootMainLogger.warn("v6 login temporarily locked by the backend — stop retrying", {
+          code: result.code,
+          msg: result.msg,
+        });
+        return "locked";
+      }
+      if (result.code !== 0) {
+        rootMainLogger.warn("v6 login failed", { code: result.code, msg: result.msg });
+        return "failed";
+      }
+      this.persistentData.megaApi = mega.exportSession(
+        megaLoginHash(this.config.username, this.config.password, this.persistentData.openudid)
+      );
+      this.writePersistentData();
+      rootMainLogger.info("v6 login: success, mega session persisted");
+      try {
+        await this.syncMegaPushRegistration();
+      } catch {
+        // push may not be initialized yet (e.g. during isolated loginMega tests)
+      }
+      return "ok";
+    } catch (err) {
+      rootMainLogger.error("v6 login error", { error: getError(ensureError(err)) });
+      return "failed";
+    }
   }
 
   public getPushPersistentIds(): string[] {
