@@ -4584,63 +4584,75 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
   }
 
   private async getDSKKeys(): Promise<void> {
-    if (this.api.isConnected()) {
-      try {
-        const data: {
-          invalid_dsks: {
-            [index: string]: string;
-          };
-          station_sns: Array<string>;
-          transaction: string;
-        } = {
-          invalid_dsks: {},
-          station_sns: [this.rawStation.station_sn],
-          transaction: `${new Date().getTime()}`,
+    // Token is enough for get_dsk_keys. Gating on api.isConnected() races P2P connect
+    // against HTTP login (especially eufy_mega) and silently skips DSK fetch — cloud
+    // lookup then gets LOOKUP_RESP errors and never returns LOOKUP_ADDR.
+    if (!this.api.getToken()) {
+      rootP2PLogger.warn(`Get DSK keys - skipped, no cloud token yet`, {
+        stationSN: this.rawStation.station_sn,
+        apiConnected: this.api.isConnected(),
+      });
+      return;
+    }
+    try {
+      const data: {
+        invalid_dsks: {
+          [index: string]: string;
         };
-        data.invalid_dsks[this.rawStation.station_sn] = "";
-        const response = await this.api.request({
-          method: "post",
-          endpoint: "v1/app/equipment/get_dsk_keys",
-          data: data,
-        });
-        rootP2PLogger.debug(`Get DSK keys - Response:`, { stationSN: this.rawStation.station_sn, data: response.data });
+        station_sns: Array<string>;
+        transaction: string;
+      } = {
+        invalid_dsks: {},
+        station_sns: [this.rawStation.station_sn],
+        transaction: `${new Date().getTime()}`,
+      };
+      data.invalid_dsks[this.rawStation.station_sn] = "";
+      const response = await this.api.request({
+        method: "post",
+        endpoint: "v1/app/equipment/get_dsk_keys",
+        data: data,
+      });
+      rootP2PLogger.info(`Get DSK keys - Response:`, {
+        stationSN: this.rawStation.station_sn,
+        code: response.data?.code,
+        msg: response.data?.msg,
+        apiConnected: this.api.isConnected(),
+      });
 
-        if (response.status == 200) {
-          const result: ResultResponse = response.data;
-          if (result.code == 0) {
-            const dataresult: DskKeyResponse = result.data;
-            dataresult.dsk_keys.forEach((key) => {
-              if (key.station_sn == this.rawStation.station_sn) {
-                this.dskKey = key.dsk_key;
-                this.dskExpiration = new Date(key.expiration * 1000);
-                rootP2PLogger.debug(`Get DSK keys - received key and expiration`, {
-                  stationSN: this.rawStation.station_sn,
-                  dskKey: this.dskKey,
-                  dskExpiration: this.dskExpiration,
-                });
-              }
-            });
-          } else {
-            rootP2PLogger.error(`Get DSK keys - Response code not ok`, {
-              stationSN: this.rawStation.station_sn,
-              code: result.code,
-              msg: result.msg,
-            });
-          }
+      if (response.status == 200) {
+        const result: ResultResponse = response.data;
+        if (result.code == 0) {
+          const dataresult: DskKeyResponse = result.data;
+          dataresult.dsk_keys.forEach((key) => {
+            if (key.station_sn == this.rawStation.station_sn) {
+              this.dskKey = key.dsk_key;
+              this.dskExpiration = new Date(key.expiration * 1000);
+              rootP2PLogger.info(`Get DSK keys - received key and expiration`, {
+                stationSN: this.rawStation.station_sn,
+                dskExpiration: this.dskExpiration,
+              });
+            }
+          });
         } else {
-          rootP2PLogger.error(`Get DSK keys - Status return code not 200`, {
+          rootP2PLogger.error(`Get DSK keys - Response code not ok`, {
             stationSN: this.rawStation.station_sn,
-            status: response.status,
-            statusText: response.statusText,
+            code: result.code,
+            msg: result.msg,
           });
         }
-      } catch (err) {
-        const error = ensureError(err);
-        rootP2PLogger.error(`Get DSK keys - Generic Error`, {
-          error: getError(error),
+      } else {
+        rootP2PLogger.error(`Get DSK keys - Status return code not 200`, {
           stationSN: this.rawStation.station_sn,
+          status: response.status,
+          statusText: response.statusText,
         });
       }
+    } catch (err) {
+      const error = ensureError(err);
+      rootP2PLogger.error(`Get DSK keys - Generic Error`, {
+        error: getError(error),
+        stationSN: this.rawStation.station_sn,
+      });
     }
   }
 
