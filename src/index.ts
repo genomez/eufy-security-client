@@ -1,5 +1,6 @@
 export * from "./http";
 export * from "./p2p";
+export * from "./rtc";
 export * from "./push";
 export * from "./interfaces";
 export * from "./eufysecurity";

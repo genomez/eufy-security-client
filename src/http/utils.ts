@@ -36,7 +36,7 @@ import { ImageBaseCodeError } from "./error";
 import { LockPushEvent } from "./../push/types";
 import { Station } from "./station";
 import { rootHTTPLogger } from "../logging";
-import { getError, isEmpty } from "../utils";
+import { getError, isEmpty, isValidUrl } from "../utils";
 import { PushMessage } from "../push/models";
 
 export const normalizeVersionString = function (version: string): number[] | null {
@@ -971,18 +971,28 @@ export const loadImageOverP2P = function (
   station: Station,
   device: Device,
   id: string,
-  p2pTimeouts: Map<string, NodeJS.Timeout>
+  p2pTimeouts: Map<string, NodeJS.Timeout>,
+  delaySeconds?: number
 ): void {
-  if (station.hasCommand(CommandName.StationDatabaseQueryLatestInfo) && p2pTimeouts.get(id) === undefined) {
-    const seconds = getWaitSeconds(device);
-    p2pTimeouts.set(
-      id,
-      setTimeout(async () => {
-        station.databaseQueryLatestInfo();
-        p2pTimeouts.delete(id);
-      }, seconds * 1000)
-    );
+  if (!station.hasCommand(CommandName.StationDatabaseQueryLatestInfo)) {
+    return;
   }
+  const pending = p2pTimeouts.get(id);
+  if (pending !== undefined) {
+    clearTimeout(pending);
+    p2pTimeouts.delete(id);
+  }
+  const defaultSeconds = getWaitSeconds(device);
+  const seconds =
+    delaySeconds ??
+    (station.isStationHomeBaseProfessionalS1() ? 2 : defaultSeconds);
+  p2pTimeouts.set(
+    id,
+    setTimeout(async () => {
+      station.databaseQueryLatestInfo();
+      p2pTimeouts.delete(id);
+    }, seconds * 1000)
+  );
 };
 
 export const loadEventImage = function (
@@ -992,10 +1002,23 @@ export const loadEventImage = function (
   message: PushMessage,
   p2pTimeouts: Map<string, NodeJS.Timeout>
 ): void {
+  const filePath = message.file_path;
+  if (!isEmpty(filePath) && !isValidUrl(filePath!)) {
+    if (station.hasCommand(CommandName.StationDownloadImage)) {
+      if (device.hasProperty(PropertyName.DevicePictureUrl)) {
+        device.updateProperty(PropertyName.DevicePictureUrl, filePath!, true);
+      }
+      station.downloadImage(filePath!);
+      return;
+    }
+  }
   if (message.notification_style === NotificationType.MOST_EFFICIENT) {
     loadImageOverP2P(station, device, device.getSerial(), p2pTimeouts);
   } else {
     if (!isEmpty(message.pic_url)) {
+      if (station.isStationHomeBaseProfessionalS1()) {
+        loadImageOverP2P(station, device, device.getSerial(), p2pTimeouts, 3);
+      }
       getImage(api, device.getSerial(), message.pic_url!)
         .then((image) => {
           if (image.data.length > 0) {

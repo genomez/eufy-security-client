@@ -115,6 +115,7 @@ import {
   IndoorPushEvent,
   SmartSafeEvent,
   HB3PairedDevicePushEvent,
+  HB3PairedDeviceMessageType,
   GarageDoorPushEvent,
   SmartDropOpen,
   SmartDropOpenedBy,
@@ -1849,6 +1850,10 @@ export class Device extends TypedEmitter<DeviceEvents> {
     // Nothing to do
   }
 
+  public requestEventImage(station: Station, message: PushMessage): void {
+    loadEventImage(station, this.api, this, message, this.pictureEventTimeouts);
+  }
+
   public setCustomPropertyValue(name: string, value: PropertyValue): void {
     const metadata = this.getPropertyMetadata(name);
     if (typeof metadata.key === "string" && metadata.key.startsWith("custom_")) {
@@ -3217,7 +3222,7 @@ export class Camera extends Device {
     eventDurationSeconds: number
   ): void {
     if (motionEvent === "start") {
-      loadImageOverP2P(station, this, this.getSerial(), this.pictureEventTimeouts);
+      loadImageOverP2P(station, this, this.getSerial(), this.pictureEventTimeouts, 2);
       this.updateProperty(PropertyName.DeviceMotionDetected, true);
       this.clearEventTimeout(DeviceEvent.MotionDetected);
       this.eventTimeouts.set(
@@ -3321,7 +3326,10 @@ export class Camera extends Device {
             eventDurationSeconds: eventDurationSeconds,
           });
         }
-      } else if (message.msg_type === DeviceType.HB3) {
+      } else if (
+        message.msg_type === DeviceType.HB3 ||
+        message.msg_type === HB3PairedDeviceMessageType.SECURITY_EVT
+      ) {
         if (message.device_sn === this.getSerial()) {
           try {
             loadEventImage(station, this.api, this, message, this.pictureEventTimeouts);

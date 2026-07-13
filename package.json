@@ -14,7 +14,7 @@
   },
   "scripts": {
     "build:ts": "tsc -p tsconfig.build.json && npm run copy-proto-build",
-    "copy-proto-build": "npx copyfiles -u 1 \"src/**/*.proto\" \"src/**/*.crt\" build",
+    "copy-proto-build": "npx copyfiles -u 1 \"src/**/*.proto\" \"src/**/*.crt\" \"src/rtc/libsctp/*\" build",
     "test": "jest --coverage",
     "test:watch": "jest --watch",
     "prepare": "npm run build",
@@ -57,6 +57,7 @@
     "image-type": "^6.1.0",
     "long": "^5.2.3",
     "mqtt": "^5.15.0",
+    "node-datachannel": "^0.32.3",
     "node-rsa": "^1.1.1",
     "node-schedule": "^2.1.1",
     "p-throttle": "^8.1.0",

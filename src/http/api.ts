@@ -83,6 +83,7 @@ import {
 } from "./error";
 import { getNullTerminatedString } from "../p2p/utils";
 import { rootHTTPLogger } from "../logging";
+import { MegaRtcCredentials } from "../rtc/types";
 
 type pThrottledFunction = <F extends AnyFunction>(function_: F) => ThrottledFunction<F>;
 
@@ -99,6 +100,7 @@ export class HTTPApi extends TypedEmitter<HTTPApiEvents> {
 
   private token: string | null = null;
   private tokenExpiration: Date | null = null;
+  private megaRtcCredentials?: MegaRtcCredentials;
   private renewAuthTokenJob?: schedule.Job;
 
   private connected = false;
@@ -1218,6 +1220,15 @@ export class HTTPApi extends TypedEmitter<HTTPApiEvents> {
 
   public setTokenExpiration(tokenExpiration: Date): void {
     this.tokenExpiration = tokenExpiration;
+  }
+
+  /** eufy_mega token for T9000 WebRTC signaling (set from {@link EufySecurity} mega session). */
+  public setMegaRtcCredentials(credentials: MegaRtcCredentials): void {
+    this.megaRtcCredentials = credentials;
+  }
+
+  public getMegaRtcCredentials(): MegaRtcCredentials | null {
+    return this.megaRtcCredentials ?? null;
   }
 
   public getAPIBase(): string {

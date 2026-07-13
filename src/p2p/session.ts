@@ -31,6 +31,9 @@ import {
   HOME_BASE_S1_GRID_MOTION_ENABLED,
   HomeBaseS1GridNotifyPayload,
 } from "./homebaseS1Grid";
+import { portalPacketFromP2PMessage, RtcCommandPending, RtcCommandTransport } from "../rtc/rtcCommandBridge";
+import { dispatchRtcInbound, shouldOptimisticRtcPropertySuccess, optimisticRtcReturnCode, RtcInboundSession, applyFloodlightStateFromAck } from "../rtc/rtcInbound";
+import { dispatchPortalDatabaseInbound, StationDatabaseInboundSession } from "../rtc/stationDatabaseInbound";
 import {
   sendMessage,
   hasHeader,
@@ -236,6 +239,7 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
   private lookup2RetryTimeout?: NodeJS.Timeout;
   private heartbeatTimeout?: NodeJS.Timeout;
   private keepaliveTimeout?: NodeJS.Timeout;
+  private rtcKeepaliveTimeout?: NodeJS.Timeout;
   private esdDisconnectTimeout?: NodeJS.Timeout;
   private secondaryCommandTimeout?: NodeJS.Timeout;
   private connectTime: number | null = null;
@@ -264,6 +268,12 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
   private encryption: EncryptionType = EncryptionType.NONE;
   private p2pKey?: Buffer;
   private enableEmbeddedPKCS1Support = false;
+
+  /** T9000 WebRTC command path (replaces UDP P2P when active). */
+  private rtcTransport?: RtcCommandTransport;
+  private readonly rtcPending = new RtcCommandPending();
+  /** When true, never start legacy UDP P2P — commands wait for WebRTC reconnect. */
+  private rtcCommandOnly = false;
 
   constructor(
     rawStation: StationListResponse,
@@ -431,6 +441,11 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
     this.keepaliveTimeout = undefined;
   }
 
+  private _clearRtcKeepaliveTimeout(): void {
+    this._clearTimeout(this.rtcKeepaliveTimeout);
+    this.rtcKeepaliveTimeout = undefined;
+  }
+
   private _clearConnectTimeout(): void {
     this._clearTimeout(this.connectTimeout);
     this.connectTimeout = undefined;
@@ -487,6 +502,7 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
   private _disconnected(): void {
     this._clearHeartbeatTimeout();
     this._clearKeepaliveTimeout();
+    this._clearRtcKeepaliveTimeout();
     this._clearLocalLookupRetryTimeout();
     this._clearLookupRetryTimeout();
     this._clearLookup2Timeout();
@@ -620,7 +636,39 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
   }
 
   public isConnected(): boolean {
-    return this.connected;
+    return this.connected || (this.rtcTransport?.isActive() ?? false);
+  }
+
+  /** Wire T9000 WebRTC transport for command send/receive. */
+  public setRtcCommandOnly(value: boolean): void {
+    this.rtcCommandOnly = value;
+  }
+
+  public setRtcCommandTransport(transport?: RtcCommandTransport): void {
+    if (!transport) {
+      this._clearRtcKeepaliveTimeout();
+      this.rtcPending.clear();
+    }
+    this.rtcTransport = transport;
+    if (transport?.isActive()) {
+      this.sendQueuedMessage();
+      this.scheduleRtcKeepalive();
+    }
+  }
+
+  public getStationSn(): string {
+    return this.rawStation.station_sn;
+  }
+
+  public getP2pDid(): string | undefined {
+    return this.rawStation.p2p_did;
+  }
+
+  public handleRtcIncoming(data: Buffer, linkType = 1): void {
+    if (this.rtcPending.handleIncoming(data, linkType)) {
+      return;
+    }
+    dispatchRtcInbound(this as unknown as RtcInboundSession, data, linkType);
   }
 
   private _startConnectTimeout(): void {
@@ -837,7 +885,7 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
 
   private sendQueuedMessage(): void {
     if (this.sendQueue.length > 0) {
-      if (this.connected) {
+      if (this.isConnected()) {
         let queuedMessage: P2PQueueMessage;
         while ((queuedMessage = this.sendQueue.shift()!) !== undefined) {
           let exists = false;
@@ -863,7 +911,8 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
           }
         }
       } else if (
-        !this.connected &&
+        !this.isConnected() &&
+        !this.rtcCommandOnly &&
         this.sendQueue.filter(
           (queue) =>
             queue.p2pCommand.commandType !== CommandType.CMD_PING &&
@@ -925,7 +974,140 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
     }
   }
 
+  private async _sendCommandViaRtc(message: P2PQueueMessage): Promise<void> {
+    const transport = this.rtcTransport;
+    if (!transport?.isActive()) {
+      this.sendQueue.unshift(message);
+      return;
+    }
+    const packet = portalPacketFromP2PMessage(message, transport.adminUserId);
+    if (!packet) {
+      rootP2PLogger.warn("RtcCommandBridge could not encode command", {
+        stationSN: this.rawStation.station_sn,
+        commandType: message.p2pCommand.commandType,
+        nestedCommandType: message.nestedCommandType,
+      });
+      this.emit("command", {
+        command_type:
+          message.nestedCommandType !== undefined ? message.nestedCommandType : message.p2pCommand.commandType,
+        channel: message.p2pCommand.channel,
+        return_code: ErrorCode.ERROR_INVALID_COMMAND,
+        customData: message.customData,
+      } as CommandResult);
+      this.sendQueuedMessage();
+      return;
+    }
+    const segmen = packet[11] ?? 0;
+    const isKeepalive =
+      message.p2pCommand.commandType === CommandType.CMD_PING ||
+      message.p2pCommand.commandType === CommandType.CMD_GET_DEVICE_PING;
+    if (!isKeepalive) {
+      rootP2PLogger.info("RtcCommandBridge sending command", {
+        stationSN: this.rawStation.station_sn,
+        commandType: message.p2pCommand.commandType,
+        nestedCommandType: message.nestedCommandType,
+        channel: message.p2pCommand.channel,
+        segmen,
+        bytes: packet.length,
+        floodlightValue:
+          message.nestedCommandType === CommandType.CMD_SET_FLOODLIGHT_MANUAL_SWITCH
+            ? (() => {
+                try {
+                  const raw = message.p2pCommand.value as string;
+                  const json = JSON.parse(raw) as { data?: { value?: number } };
+                  return json.data?.value;
+                } catch {
+                  return message.p2pCommand.value;
+                }
+              })()
+            : undefined,
+      });
+    }
+    if (isKeepalive) {
+      try {
+        transport.send(packet);
+      } catch (err) {
+        rootP2PLogger.debug("RTC keepalive send skipped", {
+          stationSN: this.rawStation.station_sn,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        this._clearRtcKeepaliveTimeout();
+      }
+      this.sendQueuedMessage();
+      return;
+    }
+    if (
+      message.customData?.property &&
+      shouldOptimisticRtcPropertySuccess(message.nestedCommandType)
+    ) {
+      transport.send(packet);
+      rootP2PLogger.info("RtcCommandBridge optimistic rtc property success", {
+        stationSN: this.rawStation.station_sn,
+        segmen,
+      });
+      this.emit("command", {
+        command_type:
+          message.nestedCommandType !== undefined ? message.nestedCommandType : message.p2pCommand.commandType,
+        channel: message.p2pCommand.channel,
+        return_code: optimisticRtcReturnCode(),
+        customData: message.customData,
+      } as CommandResult);
+      this.sendQueuedMessage();
+      return;
+    }
+    this.rtcPending.track(
+      segmen,
+      message.p2pCommand.commandType,
+      message.p2pCommand.channel ?? 0,
+      message.nestedCommandType,
+      this.MAX_AKNOWLEDGE_TIMEOUT,
+      (returnCode, parsed) => {
+        const channel = message.p2pCommand.channel ?? 0;
+        if (
+          returnCode === ErrorCode.ERROR_PPCS_SUCCESSFUL &&
+          parsed?.data !== undefined &&
+          (message.nestedCommandType === CommandType.CMD_DATABASE ||
+            message.nestedCommandType === CommandType.CMD_DATABASE_IMAGE)
+        ) {
+          dispatchPortalDatabaseInbound(
+            this as unknown as StationDatabaseInboundSession,
+            this.rawStation.p2p_did,
+            parsed,
+            undefined,
+            message.nestedCommandType
+          );
+        }
+        if (
+          returnCode === ErrorCode.ERROR_PPCS_SUCCESSFUL &&
+          (message.nestedCommandType === CommandType.CMD_SET_FLOODLIGHT_MANUAL_SWITCH ||
+            message.p2pCommand.commandType === CommandType.CMD_SET_FLOODLIGHT_MANUAL_SWITCH)
+        ) {
+          const synced = parsed
+            ? applyFloodlightStateFromAck(this as unknown as RtcInboundSession, channel, parsed)
+            : false;
+          if (!synced && message.customData?.property?.name === "light") {
+            const enabled = message.customData.property.value === true;
+            this.emit("floodlight manual switch", channel, enabled);
+          }
+        }
+        this.emit("command", {
+          command_type:
+            message.nestedCommandType !== undefined ? message.nestedCommandType : message.p2pCommand.commandType,
+          channel: message.p2pCommand.channel,
+          return_code: returnCode,
+          customData: message.customData,
+        } as CommandResult);
+        this.sendQueuedMessage();
+      }
+    );
+    transport.send(packet);
+  }
+
   private async _sendCommand(message: P2PMessageState | P2PQueueMessage): Promise<void> {
+    if (isP2PQueueMessage(message) && this.rtcTransport?.isActive()) {
+      await this._sendCommandViaRtc(message);
+      return;
+    }
     if (isP2PQueueMessage(message)) {
       const ageing = +new Date() - message.timestamp;
       if (ageing <= this.MAX_COMMAND_QUEUE_TIMEOUT) {
@@ -4359,6 +4541,27 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
         stationSN: this.rawStation.station_sn,
       });
     }
+  }
+
+  /** T9000 WebRTC: periodic CMD_PING on command channel (legacy P2P heartbeat equivalent). */
+  private scheduleRtcKeepalive(): void {
+    if (!this.rtcTransport?.isActive()) {
+      rootP2PLogger.debug("RTC keepalive not activated because no WebRTC transport is present", {
+        stationSN: this.rawStation.station_sn,
+      });
+      return;
+    }
+    if (this.rtcTransport.isCommandChannelReady && !this.rtcTransport.isCommandChannelReady()) {
+      rootP2PLogger.debug("RTC keepalive skipped — command channel not ready", {
+        stationSN: this.rawStation.station_sn,
+      });
+      this._clearRtcKeepaliveTimeout();
+      return;
+    }
+    this.sendCommandPing(Station.CHANNEL);
+    this.rtcKeepaliveTimeout = setTimeout(() => {
+      this.scheduleRtcKeepalive();
+    }, this.getHeartbeatInterval());
   }
 
   public getDownloadRSAPrivateKey(): NodeRSA {

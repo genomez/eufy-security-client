@@ -8,6 +8,7 @@ import EventEmitter from "events";
 import { EufySecurityEvents, EufySecurityConfig, EufySecurityPersistentData } from "./interfaces";
 import { HTTPApi } from "./http/api";
 import { MegaHTTPApi, megaLoginHash } from "./http/megaApi";
+import { MegaSession } from "./http/megaInterfaces";
 import {
   Devices,
   FullDevices,
@@ -22,6 +23,7 @@ import {
   DeviceConfig,
 } from "./http/interfaces";
 import { Station } from "./http/station";
+import { EventImageCache } from "./http/eventImageCache";
 import { ConfirmInvite, DeviceListResponse, HouseInviteListResponse, Invite, StationListResponse } from "./http/models";
 import {
   CommandName,
@@ -147,6 +149,11 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
   private pushCloudRegistered = false;
   private pushCloudChecked = false;
   private persistentFile!: string;
+  private eventImageCache?: EventImageCache;
+  /** Maps station image file paths to the device that requested them. */
+  private pendingImageFiles = new Map<string, string>();
+  /** Last light on/off intent per device — replayed after T9000 WebRTC reconnect. */
+  private pendingDeviceLightBySerial = new Map<string, boolean>();
   private persistentData: EufySecurityPersistentData = {
     country: "",
     openudid: "",
@@ -245,6 +252,7 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
     } else if (!existsSync(this.config.persistentDir)) {
       this.config.persistentDir = path.resolve(__dirname, "../../..");
     }
+    this.eventImageCache = new EventImageCache(this.config.persistentDir);
 
     if (this.config.persistentData) {
       this.persistentData = JSON.parse(this.config.persistentData) as EufySecurityPersistentData;
@@ -375,6 +383,8 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
     }
     this.api.setSerialNumber(this.persistentData.serial_number);
 
+    this.syncMegaRtcCredentialsToApi();
+
     this.pushService = await PushNotificationService.initialize();
     this.pushService.on("connect", async (token: string) => {
       this.pushCloudRegistered = await this.api.registerPushToken(token);
@@ -427,10 +437,31 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
           rootMainLogger.debug("v6: credentials changed since last login, ignoring stored mega session");
         } else {
           this.megaApi.restoreSession(saved);
+          this.syncMegaRtcCredentialsToApi(saved);
         }
       }
     }
     return this.megaApi;
+  }
+
+  /**
+   * Push persisted eufy_mega session into HTTPApi for T9000 WebRTC signaling.
+   */
+  private syncMegaRtcCredentialsToApi(session?: MegaSession): void {
+    const saved = session ?? this.persistentData.megaApi;
+    if (!saved?.cloud_token || !saved.user_id) {
+      return;
+    }
+    if (saved.cloud_token_expiration && Date.now() / 1000 >= saved.cloud_token_expiration - 60) {
+      rootMainLogger.debug("v6 RTC: mega token expired, not syncing to API");
+      return;
+    }
+    this.api.setMegaRtcCredentials({
+      authToken: saved.cloud_token,
+      userId: saved.user_id,
+      region: (saved.ab ?? this.config.country ?? "US").toUpperCase(),
+    });
+    rootMainLogger.debug("v6 RTC: mega credentials synced for T9000 WebRTC");
   }
 
   private async syncMegaPushRegistration(): Promise<void> {
@@ -575,6 +606,7 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
     const serial = device.getSerial();
     if (serial && !Object.keys(this.devices).includes(serial)) {
       this.devices[serial] = device;
+      this.restoreCachedEventImage(device);
       this.emit("device added", device);
 
       if (device.isLock()) this.mqttService.subscribeLock(device.getSerial());
@@ -940,6 +972,25 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
   private onStationConnect(station: Station): void {
     this.emit("station connect", station);
     this.refreshP2PData(station);
+    void this.getDevicesFromStation(station.getSerial())
+      .then((devices) => {
+        for (const device of devices) {
+          this.restoreCachedEventImage(device);
+        }
+        setTimeout(() => {
+          void this.getDevicesFromStation(station.getSerial())
+            .then((retryDevices) => {
+              for (const device of retryDevices) {
+                const existing = device.getPropertyValue(PropertyName.DevicePicture) as Picture | undefined;
+                if (!existing?.data?.length) {
+                  this.restoreCachedEventImage(device);
+                }
+              }
+            })
+            .catch(() => undefined);
+        }, 5000);
+      })
+      .catch(() => undefined);
     if (this.refreshEufySecurityP2PTimeout[station.getSerial()] !== undefined) {
       clearTimeout(this.refreshEufySecurityP2PTimeout[station.getSerial()]);
       delete this.refreshEufySecurityP2PTimeout[station.getSerial()];
@@ -950,6 +1001,36 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
       },
       this.P2P_REFRESH_INTERVAL_MIN * 60 * 1000
     );
+    setTimeout(() => {
+      this.replayPendingDeviceLights(station);
+    }, 4000);
+  }
+
+  private replayPendingDeviceLights(station: Station): void {
+    if (!station.isConnected() || this.pendingDeviceLightBySerial.size === 0) {
+      return;
+    }
+    for (const [serial, desired] of [...this.pendingDeviceLightBySerial.entries()]) {
+      void this.getDevice(serial)
+        .then((device) => {
+          if (device.getStationSerial() !== station.getSerial()) {
+            return;
+          }
+          const current = device.getPropertyValue(PropertyName.DeviceLight) as boolean;
+          if (current === desired) {
+            this.pendingDeviceLightBySerial.delete(serial);
+            return;
+          }
+          rootMainLogger.info("Replaying pending device light command after reconnect", {
+            stationSN: station.getSerial(),
+            deviceSN: serial,
+            desired,
+            current,
+          });
+          station.switchLight(device, desired);
+        })
+        .catch(() => undefined);
+    }
   }
 
   private onHubNotifyUpdate(station: Station): void {
@@ -957,6 +1038,44 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
       stationSN: station.getSerial(),
     });
     this.refreshCloudData();
+    if (station.hasCommand(CommandName.StationDatabaseQueryLatestInfo)) {
+      setTimeout(() => {
+        if (station.isConnected()) {
+          station.databaseQueryLatestInfo();
+        }
+      }, 2000);
+    }
+  }
+
+  /** Fetch the latest event thumbnail when T9000 RTC or FCM push reports a camera event. */
+  private handleLiveEventImagePush(message: PushMessage): void {
+    void this.getDevice(message.device_sn)
+      .then((device) => {
+        if (!Device.isCamera(device.getDeviceType())) {
+          return;
+        }
+        return this.getStation(device.getStationSerial()).then((station) => {
+          rootMainLogger.info("Live event image push", {
+            stationSN: station.getSerial(),
+            deviceSN: device.getSerial(),
+            event_type: message.event_type,
+            msg_type: message.msg_type,
+            has_file_path: Boolean(message.file_path),
+            has_pic_url: Boolean(message.pic_url),
+          });
+          device.requestEventImage(station, message);
+        });
+      })
+      .catch((err) => {
+        const error = ensureError(err);
+        if (!(error instanceof DeviceNotFoundError)) {
+          rootMainLogger.debug("Live event image push error", {
+            error: getError(error),
+            device_sn: message.device_sn,
+            event_type: message.event_type,
+          });
+        }
+      });
   }
 
   private onStationDeviceVideoState(
@@ -1388,6 +1507,7 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
         megaLoginHash(this.config.username, this.config.password, this.persistentData.openudid)
       );
       this.writePersistentData();
+      this.syncMegaRtcCredentialsToApi(this.persistentData.megaApi);
       rootMainLogger.info("v6 login: success, mega session persisted");
       try {
         await this.syncMegaPushRegistration();
@@ -1648,6 +1768,9 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
     this.emit("push message", message);
 
     try {
+      if (message.device_sn && message.event_type !== undefined) {
+        void this.handleLiveEventImagePush(message);
+      }
       rootMainLogger.debug("Received push message", { message: message });
       try {
         if (
@@ -1807,6 +1930,7 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
         station.setWatermark(device, value as number);
         break;
       case PropertyName.DeviceLight:
+        this.pendingDeviceLightBySerial.set(device.getSerial(), value as boolean);
         station.switchLight(device, value as boolean);
         break;
       case PropertyName.DeviceLightSettingsEnable:
@@ -2576,6 +2700,20 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
       });
   }
 
+  private applyStationCommandPropertyUpdate(station: Station, result: CommandResult): void {
+    if (result.customData?.property === undefined) {
+      return;
+    }
+    station.updateProperty(result.customData.property.name, result.customData.property.value);
+    if (
+      result.customData.property.name === PropertyName.StationGuardMode &&
+      result.command_type === CommandType.CMD_SET_ARMING &&
+      typeof result.customData.property.value === "number"
+    ) {
+      station.updateProperty(PropertyName.StationCurrentMode, result.customData.property.value);
+    }
+  }
+
   private onStationCommandResult(station: Station, result: CommandResult): void {
     this.emit("station command result", station, result);
     if (result.return_code === 0) {
@@ -2621,6 +2759,9 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
               const metadata = device.getPropertyMetadata(result.customData.property.name);
               if (typeof result.customData.property.value !== "object" || metadata.type === "object") {
                 device.updateProperty(result.customData.property.name, result.customData.property.value);
+              }
+              if (result.customData.property.name === PropertyName.DeviceLight) {
+                this.pendingDeviceLightBySerial.delete(device.getSerial());
               }
             } else if (station.hasProperty(result.customData.property.name)) {
               const metadata = station.getPropertyMetadata(result.customData.property.name);
@@ -2677,9 +2818,7 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
         .catch((err) => {
           const error = ensureError(err);
           if (error instanceof DeviceNotFoundError) {
-            if (result.customData !== undefined && result.customData.property !== undefined) {
-              station.updateProperty(result.customData.property.name, result.customData.property.value);
-            }
+            this.applyStationCommandPropertyUpdate(station, result);
           } else {
             rootMainLogger.error(`Station command result error`, {
               error: getError(error),
@@ -2861,9 +3000,7 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
         .catch((err) => {
           const error = ensureError(err);
           if (error instanceof DeviceNotFoundError) {
-            if (result.customData !== undefined && result.customData.property !== undefined) {
-              station.updateProperty(result.customData.property.name, result.customData.property.value);
-            }
+            this.applyStationCommandPropertyUpdate(station, result);
           } else {
             rootMainLogger.error(`Station secondary command result error`, {
               error: getError(error),
@@ -2956,6 +3093,7 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
       } else if (name === PropertyName.DeviceRTSPStream && (value as boolean) === false) {
         device.setCustomPropertyValue(PropertyName.DeviceRTSPStreamUrl, "");
       } else if (name === PropertyName.DevicePictureUrl && value !== "") {
+        this.registerPendingImageFile(value as string, device.getSerial());
         if (!isValidUrl(value as string)) {
           this.getStation(device.getStationSerial())
             .then((station: Station) => {
@@ -3769,20 +3907,111 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
     }
   }
 
+  private registerPendingImageFile(file: string, deviceSn: string): void {
+    if (file && deviceSn) {
+      this.pendingImageFiles.set(file, deviceSn);
+    }
+  }
+
+  private extractCameraChannelFromImageFile(file: string): number | undefined {
+    const match = file.match(/\/Camera(\d{2})0000\//);
+    if (!match) {
+      return undefined;
+    }
+    const channel = Number.parseInt(match[1], 10);
+    return Number.isFinite(channel) ? channel : undefined;
+  }
+
+  private extractImageFileTimestamp(file: string): number | undefined {
+    const match = file.match(/(\d{14})_/);
+    if (!match) {
+      return undefined;
+    }
+    const timestamp = Number.parseInt(match[1], 10);
+    return Number.isFinite(timestamp) ? timestamp : undefined;
+  }
+
+  private findDeviceForStationImageDownload(devices: Device[], file: string): Device | undefined {
+    for (const device of devices) {
+      if (device.getPropertyValue(PropertyName.DevicePictureUrl) === file) {
+        return device;
+      }
+    }
+    const pendingSn = this.pendingImageFiles.get(file);
+    if (pendingSn) {
+      const pending = devices.find((device) => device.getSerial() === pendingSn);
+      if (pending) {
+        return pending;
+      }
+    }
+    const channel = this.extractCameraChannelFromImageFile(file);
+    if (channel !== undefined) {
+      const byChannel = devices.find((device) => device.getChannel() === channel);
+      if (byChannel) {
+        return byChannel;
+      }
+    }
+    return undefined;
+  }
+
+  private applyStationImageDownload(device: Device, file: string, picture: Picture): void {
+    rootMainLogger.info("onStationImageDownload - Set picture for device", {
+      deviceSN: device.getSerial(),
+      file,
+      picture_ext: picture.type.ext,
+      picture_mime: picture.type.mime,
+      bytes: picture.data.length,
+    });
+    if (device.hasProperty(PropertyName.DevicePictureUrl)) {
+      device.updateProperty(PropertyName.DevicePictureUrl, file, true);
+    }
+    device.updateProperty(PropertyName.DevicePicture, picture, true);
+    this.eventImageCache?.save(device.getSerial(), file, picture);
+    this.pendingImageFiles.delete(file);
+  }
+
+  private restoreCachedEventImage(device: Device, force = false): void {
+    const cached = this.eventImageCache?.load(device.getSerial());
+    if (!cached) {
+      return;
+    }
+    const existing = device.getPropertyValue(PropertyName.DevicePicture) as Picture | undefined;
+    if (!force && existing?.data?.length) {
+      return;
+    }
+    const currentUrl = device.getPropertyValue(PropertyName.DevicePictureUrl) as string | undefined;
+    const cacheTs = this.extractImageFileTimestamp(cached.file);
+    const currentTs = currentUrl ? this.extractImageFileTimestamp(currentUrl) : undefined;
+    if (cacheTs && currentTs && currentTs >= cacheTs) {
+      return;
+    }
+    if (device.hasProperty(PropertyName.DevicePictureUrl)) {
+      device.updateProperty(PropertyName.DevicePictureUrl, cached.file, true);
+    }
+    device.updateProperty(PropertyName.DevicePicture, cached.picture, true);
+    rootMainLogger.info("Restored cached event image", {
+      deviceSN: device.getSerial(),
+      file: cached.file,
+      bytes: cached.picture.data.length,
+      force,
+    });
+  }
+
   private _emitStationImageDownload(station: Station, file: string, picture: Picture): void {
     this.emit("station image download", station, file, picture);
 
     this.getDevicesFromStation(station.getSerial())
       .then((devices: Device[]) => {
-        for (const device of devices) {
-          if (device.getPropertyValue(PropertyName.DevicePictureUrl) === file) {
-            rootMainLogger.debug(
-              `onStationImageDownload - Set picture for device ${device.getSerial()} file: ${file} picture_ext: ${picture.type.ext} picture_mime: ${picture.type.mime}`
-            );
-            device.updateProperty(PropertyName.DevicePicture, picture);
-            break;
-          }
+        const device = this.findDeviceForStationImageDownload(devices, file);
+        if (device) {
+          this.applyStationImageDownload(device, file, picture);
+          return;
         }
+        rootMainLogger.warn("onStationImageDownload - No device matched image file", {
+          stationSN: station.getSerial(),
+          file,
+          deviceCount: devices.length,
+        });
       })
       .catch((err) => {
         const error = ensureError(err);
@@ -3836,8 +4065,10 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
               const raw = device.getRawDevice();
               if ("crop_local_path" in element) {
                 raw.cover_path = (element as DatabaseQueryLatestInfoLocal).crop_local_path;
+                this.registerPendingImageFile(raw.cover_path, element.device_sn);
               } else if ("crop_cloud_path" in element) {
                 raw.cover_path = (element as DatabaseQueryLatestInfoCloud).crop_cloud_path;
+                this.registerPendingImageFile(raw.cover_path, element.device_sn);
               }
               device.update(raw);
             })
