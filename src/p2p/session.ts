@@ -1088,6 +1088,22 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
           if (!synced && message.customData?.property?.name === "light") {
             const enabled = message.customData.property.value === true;
             this.emit("floodlight manual switch", channel, enabled);
+          } else if (!synced) {
+            let enabled: boolean | undefined;
+            if (message.nestedCommandType === CommandType.CMD_SET_FLOODLIGHT_MANUAL_SWITCH) {
+              try {
+                const raw = message.p2pCommand.value as string;
+                const json = JSON.parse(raw) as { data?: { value?: number } };
+                if (json.data?.value !== undefined) {
+                  enabled = json.data.value === 1;
+                }
+              } catch {
+                /* ignore */
+              }
+            }
+            if (enabled !== undefined) {
+              this.emit("floodlight manual switch", channel, enabled);
+            }
           }
         }
         this.emit("command", {
@@ -2969,7 +2985,9 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
               enabled: enabled,
               payload: data.toString(),
             });
-            this.emit("floodlight manual switch", message.channel, enabled);
+            if (!enabled) {
+              this.emit("floodlight manual switch", message.channel, enabled);
+            }
           } catch (err) {
             const error = ensureError(err);
             rootP2PLogger.error(

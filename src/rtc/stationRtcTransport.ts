@@ -139,9 +139,15 @@ export class StationRtcTransport extends EventEmitter {
   }
 
   public close(): void {
+    const wasConnected = this.connected;
     this.connecting = false;
     this.connected = false;
     this.closeSession();
+    // Intentional close() clears connected before the session async "close" handler runs,
+    // so emit here to ensure Station.onRtcDisconnect() and HA connected events fire.
+    if (wasConnected) {
+      this.emit("close");
+    }
   }
 
   private closeSession(): void {
