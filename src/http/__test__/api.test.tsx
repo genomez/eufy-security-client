@@ -120,4 +120,67 @@ describe("HTTPApi", () => {
             expect(connectHandler).not.toHaveBeenCalled();
         });
     });
+
+    describe("getPassportProfile", () => {
+        const profile = {
+            user_id: "synthetic-user",
+            email: "user@example.invalid",
+            nick_name: "Synthetic User",
+        };
+
+        it.each([
+            { name: "canonical", data: { code: 0, msg: "", data: "canonical-ciphertext" } },
+            {
+                name: "nested regional",
+                data: {
+                    code: 200,
+                    msg: "",
+                    data: { code: 200, msg: "", data: "regional-ciphertext" },
+                },
+            },
+        ])("accepts the $name passport response after decryption and validation", async ({ data }) => {
+            const api = await HTTPApi.initialize("FR", "user@example.invalid", "synthetic-password");
+            const requestSpy = jest.spyOn(api, "request").mockResolvedValue({
+                status: 200,
+                statusText: "OK",
+                headers: {},
+                data,
+            });
+            const decryptSpy = jest.spyOn(api, "decryptAPIData").mockReturnValue(profile);
+
+            await expect(api.getPassportProfile()).resolves.toEqual(profile);
+
+            expect(requestSpy).toHaveBeenCalledWith({ method: "get", endpoint: "v2/passport/profile" });
+            expect(decryptSpy).toHaveBeenCalledWith(
+                data.code === 0 ? "canonical-ciphertext" : "regional-ciphertext",
+            );
+        });
+
+        it("rejects malformed nested responses before decryption", async () => {
+            const api = await HTTPApi.initialize("FR", "user@example.invalid", "synthetic-password");
+            jest.spyOn(api, "request").mockResolvedValue({
+                status: 200,
+                statusText: "OK",
+                headers: {},
+                data: { code: 200, msg: "", data: { code: 0, msg: "", data: "ciphertext" } },
+            });
+            const decryptSpy = jest.spyOn(api, "decryptAPIData");
+
+            await expect(api.getPassportProfile()).resolves.toBeNull();
+            expect(decryptSpy).not.toHaveBeenCalled();
+        });
+
+        it("rejects decrypted data without required profile identity fields", async () => {
+            const api = await HTTPApi.initialize("FR", "user@example.invalid", "synthetic-password");
+            jest.spyOn(api, "request").mockResolvedValue({
+                status: 200,
+                statusText: "OK",
+                headers: {},
+                data: { code: 0, msg: "", data: "canonical-ciphertext" },
+            });
+            jest.spyOn(api, "decryptAPIData").mockReturnValue({});
+
+            await expect(api.getPassportProfile()).resolves.toBeNull();
+        });
+    });
 });
