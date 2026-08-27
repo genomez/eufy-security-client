@@ -175,8 +175,29 @@ import {
 import { getError, validValue } from "../utils";
 import { TalkbackStream } from "../p2p/talkback";
 import { start } from "repl";
+import { createHash, generateKeyPairSync } from "crypto";
 import { rootHTTPLogger } from "../logging";
+import { RtcSession } from "../rtc/rtcSession";
+import { RtcTurnConfig } from "../rtc/rtcPeer";
 import { StationRtcTransport } from "../rtc/stationRtcTransport";
+import { turnAllocateWake } from "../rtc/turnAllocateWake";
+import { connectAndWaitForTurn } from "../rtc/turnHarvestWait";
+import { buildPortalPacket } from "../rtc/rtcPacket";
+import {
+  HUB_FIRST_CLOUD_REFRESH_DELAY_MS,
+  isHubAuthoritativeStationCloudProperty,
+  isHubAuthoritativeStationHttpParam,
+} from "./hubAuthoritative";
+
+type CameraInfoParameter = {
+  dev_type?: number;
+  channel?: number;
+  device_channel?: number;
+  device_sn?: string;
+  dev_sn?: string;
+  param_type?: number;
+  param_value?: string;
+};
 
 export class Station extends TypedEmitter<StationEvents> {
   private api: HTTPApi;
@@ -187,11 +208,18 @@ export class Station extends TypedEmitter<StationEvents> {
   private rtcConnectedAt?: number;
   private rtcDisconnectedAt?: number;
   private rtcReconnectFailures = 0;
+  private rtcCloudWakeLastAt = 0;
+  private rtcCloudWakeInFlight = false;
+  private rtcLiveWakeLastAt = 0;
+  private rtcLiveWakeInFlight = false;
   private rtcCatchupTimers: NodeJS.Timeout[] = [];
   private rtcLivePollTimer?: NodeJS.Timeout;
   private rtcPropertyRefreshTimer?: NodeJS.Timeout;
+  private rtcDeferredCloudRefreshTimer?: NodeJS.Timeout;
   private rtcPollWatchdog?: NodeJS.Timeout;
+  private rtcProactiveReconnectTimer?: NodeJS.Timeout;
   private rtcPollMisses = 0;
+  private rtcLastDbPollAckAt = 0;
   private rtcCommandHandlerWired = false;
   private properties: PropertyValues = {};
   private rawProperties: RawValues = {};
@@ -264,6 +292,7 @@ export class Station extends TypedEmitter<StationEvents> {
     this.p2pSession.on("floodlight manual switch", (channel: number, enabled: boolean) =>
       this.onFloodlightManualSwitch(channel, enabled)
     );
+    this.p2pSession.setRtcPollAckListener((commandID, errCode) => this.acknowledgeRtcPollResponse(commandID, errCode));
     this.p2pSession.on("alarm delay", (alarmDelayEvent: AlarmEvent, alarmDelay: number) =>
       this.onAlarmDelay(alarmDelayEvent, alarmDelay)
     );
@@ -384,6 +413,9 @@ export class Station extends TypedEmitter<StationEvents> {
     const metadata = this.getPropertiesMetadata(true);
     for (const property of Object.values(metadata)) {
       if (this.rawStation[property.key] !== undefined && typeof property.key === "string") {
+        if (isHubAuthoritativeStationCloudProperty(property.name, this.isConnected())) {
+          continue;
+        }
         this.updateProperty(
           property.name,
           this.convertRawPropertyValue(property, this.rawStation[property.key] as string)
@@ -394,6 +426,9 @@ export class Station extends TypedEmitter<StationEvents> {
     }
     if (this.rawStation.params) {
       this.rawStation.params.forEach((param) => {
+        if (isHubAuthoritativeStationHttpParam(param.param_type, "http", this.isConnected())) {
+          return;
+        }
         this.updateRawProperty(param.param_type, param.param_value, "http");
       });
     }
@@ -486,6 +521,9 @@ export class Station extends TypedEmitter<StationEvents> {
   }
 
   public updateRawProperty(type: number, value: string, source: SourceType): boolean {
+    if (isHubAuthoritativeStationHttpParam(type, source, this.isConnected())) {
+      return false;
+    }
     const parsedValue = ParameterHelper.readValue(this.getSerial(), type, value, rootHTTPLogger);
     if (
       parsedValue !== undefined &&
@@ -956,11 +994,7 @@ export class Station extends TypedEmitter<StationEvents> {
    * @returns Returns true, if this is a HomeBase 3, HomeBase mini, or HomeBase Professional S1, otherwise false.
    */
   public isDeviceControlledByHomeBase(): boolean {
-    return (
-      this.isStationHomeBase3() ||
-      this.isStationHomeBaseMini() ||
-      this.isStationHomeBaseProfessionalS1()
-    );
+    return this.isStationHomeBase3() || this.isStationHomeBaseMini() || this.isStationHomeBaseProfessionalS1();
   }
 
   /**
@@ -1161,11 +1195,7 @@ export class Station extends TypedEmitter<StationEvents> {
     }
 
     if (!this.rtcTransport) {
-      this.rtcTransport = new StationRtcTransport(
-        this.getSerial(),
-        this.rawStation.member.admin_user_id,
-        creds
-      );
+      this.rtcTransport = new StationRtcTransport(this.getSerial(), this.rawStation.member.admin_user_id, creds);
       this.rtcTransport.on("connected", () => this.onRtcConnect());
       this.rtcTransport.on("close", () => this.onRtcDisconnect());
       this.rtcTransport.on("error", (err) => this.onRtcTransportError(err));
@@ -1198,6 +1228,8 @@ export class Station extends TypedEmitter<StationEvents> {
     this.rtcReconnectFailures = 0;
     this.resetCurrentDelay();
     this.rtcConnectedAt = Date.now();
+    this.rtcLastDbPollAckAt = 0;
+    this.p2pSession.resetRtcInboundDiagnostics();
     rootHTTPLogger.info(`Connected to T9000 station ${this.getSerial()} via WebRTC`);
     const adminUserId = this.rawStation.member.admin_user_id;
     if (this.rtcTransport) {
@@ -1223,31 +1255,13 @@ export class Station extends TypedEmitter<StationEvents> {
     this.runRtcReconnectCatchup();
     this.startRtcLivePoll();
     this.startRtcPropertyRefresh();
+    this.scheduleProactiveRtcReconnect();
     this.emit("connect", this);
     setTimeout(() => {
       if (this.isConnected()) {
         this.syncCurrentModeFromGuardModeIfNeeded();
       }
     }, 1500);
-    void this.api.refreshAllData().catch((err) => {
-      const error = ensureError(err);
-      rootHTTPLogger.debug("T9000 RTC connect property refresh failed", {
-        stationSN: this.getSerial(),
-        error: getError(error),
-      });
-    });
-    setTimeout(() => {
-      if (!this.isConnected()) {
-        return;
-      }
-      void this.api.refreshAllData().catch((err) => {
-        const error = ensureError(err);
-        rootHTTPLogger.debug("T9000 RTC deferred property refresh failed", {
-          stationSN: this.getSerial(),
-          error: getError(error),
-        });
-      });
-    }, 3000);
   }
 
   private onRtcDisconnect(): void {
@@ -1259,6 +1273,7 @@ export class Station extends TypedEmitter<StationEvents> {
     this.clearRtcCatchupTimers();
     this.stopRtcLivePoll();
     this.stopRtcPropertyRefresh();
+    this.clearProactiveRtcReconnect();
     this.clearRtcPollWatchdog();
     this.rtcPollMisses = 0;
     this.p2pSession.setRtcCommandTransport(undefined);
@@ -1687,12 +1702,82 @@ export class Station extends TypedEmitter<StationEvents> {
     return undefined;
   }
 
+  private _getCameraInfoChannel(param: CameraInfoParameter): number | undefined {
+    for (const candidate of [param.channel, param.device_channel, param.dev_type]) {
+      if (typeof candidate === "number" && Number.isFinite(candidate)) {
+        return candidate;
+      }
+    }
+    return undefined;
+  }
+
+  private _normalizeCameraInfoValue(type: number, value: unknown, base64 = false): string {
+    const raw = typeof value === "string" ? value : String(value ?? "");
+    let normalized = raw.trim();
+    if (base64) {
+      try {
+        normalized = Buffer.from(normalized, "base64").toString("utf8").replace(/\0+$/, "").trim();
+      } catch {
+        return raw;
+      }
+    }
+    if (type !== CommandType.CMD_SET_FLOODLIGHT_MANUAL_SWITCH) {
+      return normalized;
+    }
+
+    const normalizeScalar = (candidate: string): string | undefined => {
+      const scalar = candidate.trim().toLowerCase();
+      if (scalar === "0" || scalar === "1") return scalar;
+      if (scalar === "false") return "0";
+      if (scalar === "true") return "1";
+      return undefined;
+    };
+
+    const scalar = normalizeScalar(normalized);
+    if (scalar !== undefined) {
+      return scalar;
+    }
+
+    // Some HomeBase responses put the scalar in base64 even under params
+    // (db_bypass_str is already explicitly decoded by the caller).
+    if (!base64 && normalized.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(normalized)) {
+      try {
+        const decoded = Buffer.from(normalized, "base64").toString("utf8").replace(/\0+$/, "").trim();
+        const decodedScalar = normalizeScalar(decoded);
+        if (decodedScalar !== undefined) {
+          return decodedScalar;
+        }
+      } catch {
+        // Keep the original value so an unsupported response cannot become a
+        // false state.
+      }
+    }
+    return normalized;
+  }
+
   private _handleCameraInfoParameters(
     devices: { [index: string]: RawValues },
-    channel: number,
+    channel: number | undefined,
     type: number,
-    value: string
+    value: string,
+    deviceSN?: string
   ): void {
+    if (deviceSN !== undefined) {
+      if (!devices[deviceSN]) {
+        devices[deviceSN] = {};
+      }
+      const parsedValue = ParameterHelper.readValue(deviceSN, type, value, rootHTTPLogger);
+      if (parsedValue !== undefined) {
+        devices[deviceSN][type] = {
+          value: parsedValue,
+          source: "p2p",
+        };
+      }
+      return;
+    }
+    if (channel === undefined) {
+      return;
+    }
     if (
       channel === Station.CHANNEL ||
       channel === Station.CHANNEL_INDOOR ||
@@ -1743,19 +1828,58 @@ export class Station extends TypedEmitter<StationEvents> {
   private onCameraInfo(cameraInfo: CmdCameraInfoResponse): void {
     rootHTTPLogger.debug("Station got camera info", { station: this.getSerial(), cameraInfo: cameraInfo });
     const devices: { [index: string]: RawValues } = {};
-    cameraInfo.params.forEach((param) => {
-      this._handleCameraInfoParameters(devices, param.dev_type, param.param_type, param.param_value);
+    const params = (Array.isArray(cameraInfo.params) ? cameraInfo.params : []) as CameraInfoParameter[];
+    const dbBypassParams = (
+      Array.isArray(cameraInfo.db_bypass_str) ? cameraInfo.db_bypass_str : []
+    ) as CameraInfoParameter[];
+    const floodlightCandidates: Array<{
+      source: "params" | "db_bypass_str";
+      channel: number | undefined;
+      state: "on" | "off" | "unrecognized";
+      valueLength: number;
+      explicitDevice: boolean;
+    }> = [];
+
+    params.forEach((param) => {
+      if (typeof param.param_type !== "number") return;
+      const value = this._normalizeCameraInfoValue(param.param_type, param.param_value);
+      const channel = this._getCameraInfoChannel(param);
+      const deviceSN =
+        typeof (param.device_sn ?? param.dev_sn) === "string" ? (param.device_sn ?? param.dev_sn) : undefined;
+      if (param.param_type === CommandType.CMD_SET_FLOODLIGHT_MANUAL_SWITCH) {
+        floodlightCandidates.push({
+          source: "params",
+          channel,
+          state: value === "1" ? "on" : value === "0" ? "off" : "unrecognized",
+          valueLength: value.length,
+          explicitDevice: deviceSN !== undefined,
+        });
+      }
+      this._handleCameraInfoParameters(devices, channel, param.param_type, value, deviceSN);
     });
-    if (Array.isArray(cameraInfo.db_bypass_str)) {
-      cameraInfo.db_bypass_str?.forEach((param) => {
-        this._handleCameraInfoParameters(
-          devices,
-          param.channel,
-          param.param_type,
-          Buffer.from(param.param_value, "base64").toString()
-        );
-      });
-    }
+    dbBypassParams.forEach((param) => {
+      if (typeof param.param_type !== "number") return;
+      const value = this._normalizeCameraInfoValue(param.param_type, param.param_value, true);
+      const channel = this._getCameraInfoChannel(param);
+      const deviceSN =
+        typeof (param.device_sn ?? param.dev_sn) === "string" ? (param.device_sn ?? param.dev_sn) : undefined;
+      if (param.param_type === CommandType.CMD_SET_FLOODLIGHT_MANUAL_SWITCH) {
+        floodlightCandidates.push({
+          source: "db_bypass_str",
+          channel,
+          state: value === "1" ? "on" : value === "0" ? "off" : "unrecognized",
+          valueLength: value.length,
+          explicitDevice: deviceSN !== undefined,
+        });
+      }
+      this._handleCameraInfoParameters(devices, channel, param.param_type, value, deviceSN);
+    });
+    rootHTTPLogger.info("Camera info floodlight poll result", {
+      params: params.length,
+      dbBypassParams: dbBypassParams.length,
+      floodlightCandidates,
+      emittedDevices: Object.keys(devices).length,
+    });
     Object.keys(devices).forEach((device) => {
       this.emit("raw device property changed", device, devices[device]);
     });
@@ -1770,6 +1894,9 @@ export class Station extends TypedEmitter<StationEvents> {
       returnCode: result.return_code,
       customData: result.customData,
     });
+    if (this.rtcTransport?.isConnected() && result.return_code === ErrorCode.ERROR_PPCS_SUCCESSFUL) {
+      this.acknowledgeRtcPollResponse(result.command_type, result.return_code);
+    }
     this.emit("command result", this, result);
   }
 
@@ -1866,15 +1993,416 @@ export class Station extends TypedEmitter<StationEvents> {
       return;
     }
     const delay = this.getRtcReconnectDelay(lastUptimeMs);
+    const wakeAfter = Number(process.env.RTC_CLOUD_WAKE_AFTER_FAILURES ?? 3);
+    // Swipe-refresh wake (TURN + expanded cloud) — same threshold as inventory by default.
+    const swipeWakeAfter = Number(
+      process.env.RTC_SWIPE_WAKE_AFTER_FAILURES ?? process.env.RTC_LIVE_WAKE_AFTER_FAILURES ?? 3
+    );
     rootHTTPLogger.info("T9000 RTC schedule reconnect", {
       stationSN: this.getSerial(),
       delayMs: delay,
       failures: this.rtcReconnectFailures,
+      cloudWakeAfter: wakeAfter,
+      swipeWakeAfter,
     });
     this.reconnectTimeout = setTimeout(() => {
       this.reconnectTimeout = undefined;
-      void this.connectRtc();
+      void (async () => {
+        if (this.rtcReconnectFailures >= wakeAfter) {
+          await this.cloudWakeHubForRtc("reconnect_backoff");
+        }
+        if (this.rtcReconnectFailures >= swipeWakeAfter) {
+          await this.liveWakeHubForRtc("reconnect_backoff");
+        }
+        if (!this.terminating) {
+          await this.connectRtc();
+        }
+      })();
     }, delay);
+  }
+
+  /**
+   * Mimic Eufy app open: refresh house station/device inventory (and mega get_devs_list)
+   * so a sleeping T9000 is more likely to accept the next WebRTC scall.
+   */
+  private async cloudWakeHubForRtc(reason: string): Promise<void> {
+    if (!this.isStationHomeBaseProfessionalS1() || this.terminating) {
+      return;
+    }
+    const minIntervalMs = Number(process.env.RTC_CLOUD_WAKE_MIN_INTERVAL_MS ?? 60_000);
+    const now = Date.now();
+    if (this.rtcCloudWakeInFlight) {
+      rootHTTPLogger.debug("T9000 RTC cloud wake skipped (in flight)", {
+        stationSN: this.getSerial(),
+        reason,
+      });
+      return;
+    }
+    if (now - this.rtcCloudWakeLastAt < minIntervalMs) {
+      rootHTTPLogger.debug("T9000 RTC cloud wake skipped (cooldown)", {
+        stationSN: this.getSerial(),
+        reason,
+        cooldownMs: minIntervalMs - (now - this.rtcCloudWakeLastAt),
+      });
+      return;
+    }
+    this.rtcCloudWakeInFlight = true;
+    this.rtcCloudWakeLastAt = now;
+    const prevAppConn = this.rawStation.app_conn;
+    rootHTTPLogger.info("T9000 RTC cloud wake — house + relation inventory (swipe-host equivalent)", {
+      stationSN: this.getSerial(),
+      reason,
+      failures: this.rtcReconnectFailures,
+    });
+    try {
+      await this.api.cloudWakeHouseInventory();
+      const hub = this.api.getHubs()[this.getSerial()];
+      if (hub) {
+        this.update(hub);
+        rootHTTPLogger.info("T9000 RTC cloud wake applied station update", {
+          stationSN: this.getSerial(),
+          appConnChanged: hub.app_conn !== prevAppConn,
+        });
+      } else {
+        rootHTTPLogger.warn("T9000 RTC cloud wake — station missing from refreshed hub list", {
+          stationSN: this.getSerial(),
+        });
+      }
+    } catch (err) {
+      const error = ensureError(err);
+      rootHTTPLogger.warn("T9000 RTC cloud wake failed", {
+        stationSN: this.getSerial(),
+        reason,
+        error: getError(error),
+      });
+    } finally {
+      this.rtcCloudWakeInFlight = false;
+    }
+  }
+
+  /** Resolve garage (or configured) camera channel for swipe-wake camera fallback. */
+  private resolveSwipeWakeCameraChannel(): number | undefined {
+    const envChannel = Number(process.env.RTC_LIVE_WAKE_CHANNEL ?? NaN);
+    if (Number.isFinite(envChannel) && envChannel > 0) {
+      return envChannel;
+    }
+    const deviceSn = (process.env.RTC_LIVE_WAKE_DEVICE_SN || "").trim();
+    if (!deviceSn) {
+      return undefined;
+    }
+    const device = this.api.getDevices()[deviceSn];
+    if (device && device.station_sn === this.getSerial()) {
+      return device.device_channel;
+    }
+    return undefined;
+  }
+
+  /**
+   * Harvest TURN creds via scall 100, hangup immediately (no PeerConnection), then
+   * run Coturn Allocate/permission/ChannelData burst — phone swipe media path without
+   * holding a failed relay session on the hub's single RTC slot.
+   */
+  private async runTurnHarvestWake(reason: string): Promise<{ turnAllocateOk: boolean }> {
+    const creds = this.api.getMegaRtcCredentials();
+    if (!creds?.authToken || !creds.userId) {
+      rootHTTPLogger.warn("T9000 RTC TURN harvest skipped — mega credentials missing", {
+        stationSN: this.getSerial(),
+      });
+      return { turnAllocateOk: false };
+    }
+
+    const gtoken = createHash("md5").update(creds.userId).digest("hex");
+    const peerIps = [this.getIPAddress(), process.env.RTC_BIND_ADDRESS || ""]
+      .map((ip) => ip?.trim())
+      .filter((ip): ip is string => !!ip && /^\d+\.\d+\.\d+\.\d+$/.test(ip));
+    const harvestTimeoutMs = Number(process.env.RTC_TURN_HARVEST_TIMEOUT_MS ?? 8000);
+
+    rootHTTPLogger.info("T9000 RTC TURN harvest wake — scall for creds then Coturn burst", {
+      stationSN: this.getSerial(),
+      reason,
+      failures: this.rtcReconnectFailures,
+      peerIps,
+      harvestTimeoutMs,
+    });
+
+    const session = new RtcSession({
+      authToken: creds.authToken,
+      gtoken,
+      stationSn: this.getSerial(),
+      adminUserId: this.rawStation.member.admin_user_id,
+      region: creds.region,
+      channelId: 0,
+      turnHarvestOnly: true,
+    });
+
+    let turnCreds: RtcTurnConfig | undefined;
+    let turnAllocateOk = false;
+    try {
+      turnCreds = await connectAndWaitForTurn(session, harvestTimeoutMs);
+      // Session auto-hangups on turn harvest; wait briefly for slot release.
+      await new Promise((r) => setTimeout(r, 300));
+      try {
+        session.close();
+      } catch {
+        /* ignore */
+      }
+      const turnResult = await turnAllocateWake(turnCreds, {
+        timeoutMs: Number(process.env.RTC_TURN_ALLOCATE_TIMEOUT_MS ?? 8000),
+        burstMs: Number(process.env.RTC_TURN_BURST_MS ?? 2500),
+        peerIps,
+      });
+      turnAllocateOk = turnResult.ok;
+      rootHTTPLogger.info("T9000 RTC TURN harvest wake finished", {
+        stationSN: this.getSerial(),
+        gotTurn: true,
+        turnAllocateOk,
+        burstPackets: turnResult.burstPackets,
+        relayedHost: turnResult.relayedHost,
+      });
+      return { turnAllocateOk };
+    } catch (err) {
+      const error = ensureError(err);
+      rootHTTPLogger.warn("T9000 RTC TURN harvest wake failed", {
+        stationSN: this.getSerial(),
+        reason,
+        gotTurn: !!turnCreds,
+        error: getError(error),
+      });
+      return { turnAllocateOk: false };
+    } finally {
+      try {
+        session.close();
+      } catch {
+        /* ignore */
+      }
+      await new Promise((r) => setTimeout(r, 400));
+    }
+  }
+
+  /**
+   * Real camera live-view wake using production ICE (LAN host / RTC_NO_TURN).
+   * Sends COMMAND_START_LIVESTREAM once the command channel opens — matching the
+   * phone app path that clears hub DTLS wedges (connect alone is not enough).
+   */
+  private async runCameraLiveWake(
+    reason: string,
+    channelId: number,
+    timeoutMs: number
+  ): Promise<{ commandChannelReady: boolean }> {
+    const creds = this.api.getMegaRtcCredentials();
+    if (!creds?.authToken || !creds.userId) {
+      rootHTTPLogger.warn("T9000 RTC camera live wake skipped — mega credentials missing", {
+        stationSN: this.getSerial(),
+        channelId,
+      });
+      return { commandChannelReady: false };
+    }
+
+    const gtoken = createHash("md5").update(creds.userId).digest("hex");
+    const adminUserId = this.rawStation.member.admin_user_id;
+    const holdMs = Math.max(8_000, Math.min(timeoutMs, 25_000));
+    rootHTTPLogger.info("T9000 RTC camera live wake — production ICE + START_LIVESTREAM", {
+      stationSN: this.getSerial(),
+      reason,
+      failures: this.rtcReconnectFailures,
+      channelId,
+      timeoutMs,
+      holdMs,
+      iceTransportPolicy: "all",
+      allowTurn: false,
+    });
+
+    const session = new RtcSession({
+      authToken: creds.authToken,
+      gtoken,
+      stationSn: this.getSerial(),
+      adminUserId,
+      region: creds.region,
+      channelId,
+      // Match production path: LAN host ICE. Relay-only never completes on this hub.
+      allowTurn: false,
+      iceTransportPolicy: "all",
+    });
+
+    const sendStartLivestream = (): boolean => {
+      if (!session.isCommandChannelReady()) {
+        return false;
+      }
+      try {
+        const { publicKey } = generateKeyPairSync("rsa", { modulusLength: 1024 });
+        const jwk = publicKey.export({ format: "jwk" });
+        const n = Buffer.from(String(jwk.n), "base64url");
+        const withLead = n[0] === 0 ? n : Buffer.concat([Buffer.from([0]), n]);
+        const encryptkey = withLead.subarray(1).toString("hex");
+        const buf = buildPortalPacket({
+          commandID: CommandType.CMD_DOORBELL_SET_PAYLOAD,
+          channelID: channelId,
+          cmd: ParamType.COMMAND_START_LIVESTREAM,
+          segmen: 1,
+          payload: {
+            account_id: adminUserId,
+            cmd: ParamType.COMMAND_START_LIVESTREAM,
+            commandType: ParamType.COMMAND_START_LIVESTREAM,
+            data: {
+              accountId: adminUserId,
+              camera_type: 0,
+              encryptkey,
+              entrytype: 0,
+              streamtype: 1,
+            },
+          },
+        });
+        const ok = session.sendCommand(buf);
+        rootHTTPLogger.info("T9000 RTC camera live wake START_LIVESTREAM sent", {
+          stationSN: this.getSerial(),
+          channelId,
+          ok,
+        });
+        return ok;
+      } catch (err) {
+        rootHTTPLogger.warn("T9000 RTC camera live wake START_LIVESTREAM failed", {
+          stationSN: this.getSerial(),
+          channelId,
+          error: getError(ensureError(err)),
+        });
+        return false;
+      }
+    };
+
+    try {
+      let liveSent = false;
+      session.on("connected", () => {
+        if (!liveSent) {
+          liveSent = true;
+          sendStartLivestream();
+        }
+      });
+      await session.connect();
+      if (!liveSent && session.isCommandChannelReady()) {
+        liveSent = true;
+        sendStartLivestream();
+      }
+      // Hold the media session briefly so the hub exits the DTLS wedge path.
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => resolve(), holdMs);
+        const done = (): void => {
+          clearTimeout(timer);
+          resolve();
+        };
+        session.once("error", done);
+        session.once("close", done);
+      });
+      const commandChannelReady = session.isCommandChannelReady() || liveSent;
+      rootHTTPLogger.info("T9000 RTC camera live wake finished", {
+        stationSN: this.getSerial(),
+        channelId,
+        commandChannelReady,
+        liveSent,
+      });
+      return { commandChannelReady };
+    } catch (err) {
+      const error = ensureError(err);
+      rootHTTPLogger.warn("T9000 RTC camera live wake failed", {
+        stationSN: this.getSerial(),
+        reason,
+        channelId,
+        error: getError(error),
+      });
+      return { commandChannelReady: false };
+    } finally {
+      try {
+        session.close();
+      } catch {
+        /* ignore */
+      }
+      await new Promise((r) => setTimeout(r, 750));
+    }
+  }
+
+  /**
+   * App pull-to-refresh recovery:
+   * 1) TURN harvest + Coturn burst (no peer held on hub)
+   * 2) Garage camera live-view with production ICE if still needed
+   */
+  private async liveWakeHubForRtc(reason: string): Promise<void> {
+    if (!this.isStationHomeBaseProfessionalS1() || this.terminating) {
+      return;
+    }
+    if (
+      process.env.RTC_SWIPE_WAKE === "0" ||
+      process.env.RTC_SWIPE_WAKE === "false" ||
+      process.env.RTC_LIVE_WAKE === "0" ||
+      process.env.RTC_LIVE_WAKE === "false"
+    ) {
+      return;
+    }
+    const minIntervalMs = Number(
+      process.env.RTC_SWIPE_WAKE_MIN_INTERVAL_MS ?? process.env.RTC_LIVE_WAKE_MIN_INTERVAL_MS ?? 90_000
+    );
+    const cameraTimeoutMs = Number(
+      process.env.RTC_SWIPE_WAKE_CAMERA_TIMEOUT_MS ??
+        process.env.RTC_SWIPE_WAKE_TIMEOUT_MS ??
+        process.env.RTC_LIVE_WAKE_TIMEOUT_MS ??
+        20_000
+    );
+    const now = Date.now();
+    if (this.rtcLiveWakeInFlight) {
+      rootHTTPLogger.debug("T9000 RTC swipe wake skipped (in flight)", {
+        stationSN: this.getSerial(),
+        reason,
+      });
+      return;
+    }
+    if (now - this.rtcLiveWakeLastAt < minIntervalMs) {
+      rootHTTPLogger.debug("T9000 RTC swipe wake skipped (cooldown)", {
+        stationSN: this.getSerial(),
+        reason,
+        cooldownMs: minIntervalMs - (now - this.rtcLiveWakeLastAt),
+      });
+      return;
+    }
+
+    this.rtcLiveWakeInFlight = true;
+    this.rtcLiveWakeLastAt = now;
+    try {
+      const forceCamera = process.env.RTC_SWIPE_WAKE_USE_CAMERA === "1";
+      const cameraFallback =
+        process.env.RTC_SWIPE_WAKE_CAMERA_FALLBACK !== "0" && process.env.RTC_SWIPE_WAKE_CAMERA_FALLBACK !== "false";
+
+      let cameraReady = false;
+      if (!forceCamera) {
+        await this.runTurnHarvestWake(reason);
+      }
+
+      if (forceCamera || cameraFallback) {
+        const cameraChannel = this.resolveSwipeWakeCameraChannel();
+        if (cameraChannel !== undefined) {
+          rootHTTPLogger.info("T9000 RTC swipe wake — camera-channel live fallback", {
+            stationSN: this.getSerial(),
+            reason,
+            cameraChannel,
+            forceCamera,
+          });
+          const cam = await this.runCameraLiveWake(
+            forceCamera ? reason : `${reason}_camera_fallback`,
+            cameraChannel,
+            cameraTimeoutMs
+          );
+          cameraReady = cam.commandChannelReady;
+        } else {
+          rootHTTPLogger.debug("T9000 RTC camera live wake skipped — no camera channel", {
+            stationSN: this.getSerial(),
+          });
+        }
+      }
+
+      if (cameraReady) {
+        // Brief pause so hub releases the wake session before main connectRtc.
+        await new Promise((r) => setTimeout(r, 750));
+      }
+    } finally {
+      this.rtcLiveWakeInFlight = false;
+    }
   }
 
   private clearRtcCatchupTimers(): void {
@@ -1893,33 +2421,102 @@ export class Station extends TypedEmitter<StationEvents> {
     this.rtcPollMisses = 0;
   }
 
-  /** Periodic cloud + hub property refresh — keeps FLC/motion state aligned when RTC push notify drops. */
+  /** Periodic cloud + hub property refresh — keeps FLC/motion/guard state aligned when RTC push notify drops. */
   private startRtcPropertyRefresh(): void {
     this.stopRtcPropertyRefresh();
     if (!this.isStationHomeBaseProfessionalS1()) {
       return;
     }
     const intervalMs = Number(process.env.RTC_PROPERTY_REFRESH_MS ?? 300_000);
+    // 0 / negative disables (TTL isolation experiments).
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+      rootHTTPLogger.info("T9000 RTC periodic property refresh disabled", {
+        stationSN: this.getSerial(),
+        intervalMs,
+      });
+      return;
+    }
     this.rtcPropertyRefreshTimer = setInterval(() => {
       if (!this.isConnected() || !this.rtcTransport?.isConnected()) {
         return;
       }
-      rootHTTPLogger.debug("T9000 RTC periodic property refresh", {
+      rootHTTPLogger.debug("T9000 RTC periodic property refresh (hub first)", {
         stationSN: this.getSerial(),
         intervalMs,
       });
+      this.runHubFirstPropertySync([0], false);
+      this.scheduleDeferredCloudRefresh();
+    }, intervalMs);
+  }
+
+  private clearDeferredCloudRefreshTimer(): void {
+    if (this.rtcDeferredCloudRefreshTimer !== undefined) {
+      clearTimeout(this.rtcDeferredCloudRefreshTimer);
+      this.rtcDeferredCloudRefreshTimer = undefined;
+    }
+  }
+
+  private scheduleDeferredCloudRefresh(): void {
+    this.clearDeferredCloudRefreshTimer();
+    this.rtcDeferredCloudRefreshTimer = setTimeout(() => {
+      this.rtcDeferredCloudRefreshTimer = undefined;
+      if (!this.isConnected()) {
+        return;
+      }
+      rootHTTPLogger.debug("T9000 deferred cloud property refresh (after hub poll)", {
+        stationSN: this.getSerial(),
+        delayMs: HUB_FIRST_CLOUD_REFRESH_DELAY_MS,
+      });
       void this.api.refreshAllData().catch((err) => {
         const error = ensureError(err);
-        rootHTTPLogger.debug("T9000 RTC periodic cloud property refresh failed", {
+        rootHTTPLogger.debug("T9000 deferred cloud property refresh failed", {
           stationSN: this.getSerial(),
           error: getError(error),
         });
       });
-      if (this.hasCommand(CommandName.StationDatabaseQueryLatestInfo)) {
-        this.databaseQueryLatestInfo();
+    }, HUB_FIRST_CLOUD_REFRESH_DELAY_MS);
+  }
+
+  /** Hub-first sync: recent events DB query + camera info (floodlight, guard mode, live params). */
+  public runHubFirstPropertySync(retryDelaysMs: number[] = [0, 2000, 5000], trackCatchupTimers = true): void {
+    if (!this.isConnected()) {
+      return;
+    }
+    rootHTTPLogger.debug("Hub-first property sync", {
+      stationSN: this.getSerial(),
+      retryDelaysMs,
+      trackCatchupTimers,
+    });
+    const schedule = (delayMs: number, fn: () => void): void => {
+      if (delayMs === 0 && !trackCatchupTimers) {
+        fn();
+        return;
       }
-      this.getCameraInfo();
-    }, intervalMs);
+      const timer = setTimeout(() => {
+        if (!this.isConnected()) {
+          return;
+        }
+        fn();
+      }, delayMs);
+      if (trackCatchupTimers) {
+        this.rtcCatchupTimers.push(timer);
+      }
+    };
+    if (this.hasCommand(CommandName.StationDatabaseQueryLatestInfo)) {
+      for (const delayMs of retryDelaysMs) {
+        schedule(delayMs, () => {
+          rootHTTPLogger.debug("Hub-first database query", { stationSN: this.getSerial(), delayMs });
+          this.databaseQueryLatestInfo();
+        });
+      }
+    }
+    for (const delayMs of retryDelaysMs) {
+      schedule(delayMs, () => {
+        rootHTTPLogger.debug("Hub-first camera info poll", { stationSN: this.getSerial(), delayMs });
+        this.getCameraInfo();
+        this.syncCurrentModeFromGuardModeIfNeeded();
+      });
+    }
   }
 
   private stopRtcPropertyRefresh(): void {
@@ -1927,6 +2524,7 @@ export class Station extends TypedEmitter<StationEvents> {
       clearInterval(this.rtcPropertyRefreshTimer);
       this.rtcPropertyRefreshTimer = undefined;
     }
+    this.clearDeferredCloudRefreshTimer();
   }
 
   private clearRtcPollWatchdog(): void {
@@ -1936,21 +2534,77 @@ export class Station extends TypedEmitter<StationEvents> {
     }
   }
 
-  /** Hub can keep SCTP alive while command/notify channels stall — detect via missed DB poll responses. */
+  /** Hub returned a successful RTC command ack — session is alive even if we did not parse the payload. */
+  private acknowledgeRtcPollResponse(commandID: number, errCode: number): void {
+    if (!this.rtcTransport?.isConnected()) {
+      return;
+    }
+    this.rtcLastDbPollAckAt = Date.now();
+    this.clearRtcPollWatchdog();
+    this.rtcPollMisses = 0;
+    rootHTTPLogger.debug("T9000 RTC poll watchdog cleared by command ack", {
+      stationSN: this.getSerial(),
+      commandID,
+      errCode,
+    });
+  }
+
+  /**
+   * The hub can keep SCTP alive while command/notify channels stall. We detect that via missed
+   * DB-latest poll responses — but only tear the session down when it is genuinely silent. The hub
+   * often answers the poll with a frame we log as an "unmatched command response" (it does not parse
+   * as a DB-latest result and so never clears the watchdog); that is still proof the session is
+   * alive, so recent inbound RTC activity suppresses the reconnect and avoids needless flapping.
+   */
+  private isRtcSessionLive(): boolean {
+    const livenessMs = Number(process.env.RTC_INBOUND_LIVENESS_MS ?? 30_000);
+    return this.p2pSession.rtcInboundIdleMs() < livenessMs;
+  }
+
+  /** Option-1 diagnostics: log inbound history when DB poll misses or stale reconnect fires. */
+  private logRtcPollMissDiagnostics(reason: "poll_miss" | "poll_timeout" | "stale_reconnect"): void {
+    const diag = this.p2pSession.getRtcInboundDiagnostics();
+    const msSinceDbAck = this.rtcLastDbPollAckAt ? Date.now() - this.rtcLastDbPollAckAt : undefined;
+    const livenessMs = Number(process.env.RTC_INBOUND_LIVENESS_MS ?? 30_000);
+    const recentSummary = diag.recent.slice(-8).map((e) => ({
+      kind: e.kind,
+      commandID: e.commandID,
+      ageMs: Math.round(e.ageMs),
+      errCode: e.errCode,
+      detail: e.detail,
+    }));
+    rootHTTPLogger.warn("T9000 RTC poll miss diagnostics", {
+      stationSN: this.getSerial(),
+      reason,
+      sessionUptimeMs: Math.round(diag.sessionUptimeMs),
+      inboundIdleMs: Number.isFinite(diag.inboundIdleMs) ? Math.round(diag.inboundIdleMs) : null,
+      msSinceLastDbPollAck: msSinceDbAck,
+      livenessThresholdMs: livenessMs,
+      sessionLive: this.isRtcSessionLive(),
+      inboundCounts: diag.counts,
+      recentInbound: recentSummary,
+    });
+  }
+
   private noteRtcPollSent(): void {
     const maxMisses = Number(process.env.RTC_POLL_MAX_MISSES ?? 3);
     const timeoutMs = Number(process.env.RTC_POLL_WATCHDOG_MS ?? 35_000);
     if (this.rtcPollWatchdog !== undefined) {
       this.clearRtcPollWatchdog();
-      this.rtcPollMisses++;
-      rootHTTPLogger.warn("T9000 RTC live poll missed database response", {
-        stationSN: this.getSerial(),
-        misses: this.rtcPollMisses,
-        maxMisses,
-      });
-      if (this.rtcPollMisses >= maxMisses) {
-        this.forceStaleRtcReconnect();
-        return;
+      if (this.isRtcSessionLive()) {
+        this.rtcPollMisses = 0;
+      } else {
+        this.rtcPollMisses++;
+        this.logRtcPollMissDiagnostics("poll_miss");
+        rootHTTPLogger.warn("T9000 RTC live poll missed database response", {
+          stationSN: this.getSerial(),
+          misses: this.rtcPollMisses,
+          maxMisses,
+        });
+        if (this.rtcPollMisses >= maxMisses) {
+          this.forceStaleRtcReconnect();
+          return;
+        }
       }
     }
     this.rtcPollWatchdog = setTimeout(() => {
@@ -1958,7 +2612,12 @@ export class Station extends TypedEmitter<StationEvents> {
       if (!this.isConnected() || !this.rtcTransport?.isConnected()) {
         return;
       }
+      if (this.isRtcSessionLive()) {
+        this.rtcPollMisses = 0;
+        return;
+      }
       this.rtcPollMisses++;
+      this.logRtcPollMissDiagnostics("poll_timeout");
       rootHTTPLogger.warn("T9000 RTC live poll timed out waiting for database response", {
         stationSN: this.getSerial(),
         misses: this.rtcPollMisses,
@@ -1974,13 +2633,224 @@ export class Station extends TypedEmitter<StationEvents> {
     if (!this.rtcTransport?.isConnected()) {
       return;
     }
+    if (process.env.RTC_NO_STALE_RECONNECT === "1" || process.env.RTC_NO_STALE_RECONNECT === "true") {
+      this.logRtcPollMissDiagnostics("stale_reconnect");
+      rootHTTPLogger.warn("T9000 RTC stale session — reconnect suppressed (RTC_NO_STALE_RECONNECT)", {
+        stationSN: this.getSerial(),
+        pollMisses: this.rtcPollMisses,
+      });
+      this.rtcPollMisses = 0;
+      this.clearRtcPollWatchdog();
+      return;
+    }
+    this.logRtcPollMissDiagnostics("stale_reconnect");
     rootHTTPLogger.warn("T9000 RTC stale session — forcing reconnect", {
       stationSN: this.getSerial(),
       pollMisses: this.rtcPollMisses,
     });
     this.rtcPollMisses = 0;
     this.clearRtcPollWatchdog();
+    this.clearProactiveRtcReconnect();
     this.rtcTransport.close();
+  }
+
+  /**
+   * Hub command/SCTP path goes silent ~360s into a continuous WebRTC session (confirmed
+   * independent of 5m property refresh). Refresh the session before that cliff.
+   * Prefer make-before-break handoff (RTC_HANDOFF=1, default) so HA stays connected while a
+   * second session comes up. If the replacement is rejected, keep the old session while its
+   * command path answers probes and retry the replacement with backoff. Hard-close only when
+   * the retained command path is no longer healthy.
+   * Set RTC_PROACTIVE_RECONNECT_MS=0 to disable.
+   */
+  private clearProactiveRtcReconnect(): void {
+    if (this.rtcProactiveReconnectTimer !== undefined) {
+      clearTimeout(this.rtcProactiveReconnectTimer);
+      this.rtcProactiveReconnectTimer = undefined;
+    }
+  }
+
+  private hardReconnectAfterRtcHandoffFailure(reason: string, attempt: number): void {
+    rootHTTPLogger.warn("T9000 RTC handoff recovery falling back to hard reconnect", {
+      stationSN: this.getSerial(),
+      reason,
+      attempt,
+    });
+    this.rtcPollMisses = 0;
+    this.clearRtcPollWatchdog();
+    this.clearProactiveRtcReconnect();
+    this.rtcTransport?.close();
+  }
+
+  private probeExistingRtcCommandPathForHandoff(attempt: number, onConfirmed: (probeAckMs: number) => void): void {
+    if (
+      !this.rtcTransport?.isConnected() ||
+      !this.rtcTransport.isCommandChannelReady() ||
+      !this.hasCommand(CommandName.StationDatabaseQueryLatestInfo)
+    ) {
+      this.hardReconnectAfterRtcHandoffFailure("existing_command_path_not_ready", attempt);
+      return;
+    }
+
+    const configuredProbeMs = Number(process.env.RTC_HANDOFF_RETRY_MS ?? 10_000);
+    const probeMs = Number.isFinite(configuredProbeMs) ? Math.max(1_000, Math.floor(configuredProbeMs)) : 10_000;
+    const probeSentAt = Date.now();
+
+    rootHTTPLogger.warn("T9000 RTC handoff recovery probing retained command path", {
+      stationSN: this.getSerial(),
+      attempt,
+      probeMs,
+    });
+    try {
+      this.databaseQueryLatestInfo();
+    } catch (err) {
+      const error = ensureError(err);
+      rootHTTPLogger.warn("T9000 RTC handoff recovery probe could not be sent", {
+        stationSN: this.getSerial(),
+        error: getError(error),
+      });
+      this.hardReconnectAfterRtcHandoffFailure("command_probe_send_failed", attempt);
+      return;
+    }
+
+    this.clearProactiveRtcReconnect();
+    this.rtcProactiveReconnectTimer = setTimeout(() => {
+      this.rtcProactiveReconnectTimer = undefined;
+      if (this.terminating) {
+        return;
+      }
+      const commandChannelReady =
+        this.rtcTransport?.isConnected() === true && this.rtcTransport.isCommandChannelReady();
+      const probeConfirmed = this.rtcLastDbPollAckAt >= probeSentAt;
+      if (!commandChannelReady || !probeConfirmed) {
+        this.hardReconnectAfterRtcHandoffFailure(
+          probeConfirmed ? "existing_command_channel_closed" : "command_probe_timeout",
+          attempt
+        );
+        return;
+      }
+      onConfirmed(this.rtcLastDbPollAckAt - probeSentAt);
+    }, probeMs);
+  }
+
+  private handleFailedProactiveRtcHandoff(attempt: number): void {
+    const configuredMaxRetries = Number(process.env.RTC_HANDOFF_MAX_RETRIES ?? 1);
+    const maxRetries = Number.isFinite(configuredMaxRetries) ? Math.max(0, Math.floor(configuredMaxRetries)) : 1;
+    const configuredBackoffMs = Number(process.env.RTC_HANDOFF_BACKOFF_MS ?? 30_000);
+    const backoffMs = Number.isFinite(configuredBackoffMs) ? Math.max(5_000, Math.floor(configuredBackoffMs)) : 30_000;
+    const useBackoff = attempt >= maxRetries;
+
+    rootHTTPLogger.warn("T9000 RTC proactive handoff failed — retaining existing session and probing before retry", {
+      stationSN: this.getSerial(),
+      attempt,
+      maxRetries,
+      backoffMs: useBackoff ? backoffMs : 0,
+    });
+
+    this.probeExistingRtcCommandPathForHandoff(attempt, (probeAckMs) => {
+      const nextAttempt = attempt + 1;
+      if (!useBackoff) {
+        rootHTTPLogger.info("T9000 RTC handoff recovery probe ok — retrying replacement without disconnect", {
+          stationSN: this.getSerial(),
+          attempt: nextAttempt,
+          probeAckMs,
+        });
+        this.attemptProactiveRtcHandoff(nextAttempt);
+        return;
+      }
+
+      rootHTTPLogger.warn("T9000 RTC replacement retry failed but retained command path is healthy — backing off", {
+        stationSN: this.getSerial(),
+        attempt,
+        nextAttempt,
+        probeAckMs,
+        backoffMs,
+      });
+      this.clearProactiveRtcReconnect();
+      this.rtcProactiveReconnectTimer = setTimeout(() => {
+        this.rtcProactiveReconnectTimer = undefined;
+        if (this.terminating) {
+          return;
+        }
+        this.probeExistingRtcCommandPathForHandoff(attempt, (freshProbeAckMs) => {
+          rootHTTPLogger.info("T9000 RTC retained command path still healthy — retrying replacement after backoff", {
+            stationSN: this.getSerial(),
+            attempt: nextAttempt,
+            probeAckMs: freshProbeAckMs,
+            backoffMs,
+          });
+          this.attemptProactiveRtcHandoff(nextAttempt);
+        });
+      }, backoffMs);
+    });
+  }
+
+  private attemptProactiveRtcHandoff(attempt: number): void {
+    const transport = this.rtcTransport;
+    if (!transport?.isConnected() || this.terminating) {
+      return;
+    }
+    void transport
+      .handoffConnect()
+      .then((ok) => {
+        if (this.terminating) {
+          return;
+        }
+        if (ok) {
+          this.rtcConnectedAt = Date.now();
+          this.scheduleProactiveRtcReconnect();
+          rootHTTPLogger.info("T9000 RTC proactive handoff ok — session refreshed without disconnect", {
+            stationSN: this.getSerial(),
+            attempt,
+          });
+          return;
+        }
+        this.handleFailedProactiveRtcHandoff(attempt);
+      })
+      .catch((err) => {
+        if (this.terminating) {
+          return;
+        }
+        const error = ensureError(err);
+        rootHTTPLogger.warn("T9000 RTC proactive handoff raised an unexpected error", {
+          stationSN: this.getSerial(),
+          attempt,
+          error: getError(error),
+        });
+        this.handleFailedProactiveRtcHandoff(attempt);
+      });
+  }
+
+  private scheduleProactiveRtcReconnect(): void {
+    this.clearProactiveRtcReconnect();
+    if (!this.isStationHomeBaseProfessionalS1()) {
+      return;
+    }
+    const afterMs = Number(process.env.RTC_PROACTIVE_RECONNECT_MS ?? 300_000);
+    if (!Number.isFinite(afterMs) || afterMs <= 0) {
+      return;
+    }
+    this.rtcProactiveReconnectTimer = setTimeout(() => {
+      this.rtcProactiveReconnectTimer = undefined;
+      if (!this.rtcTransport?.isConnected() || this.terminating) {
+        return;
+      }
+      const uptimeMs = this.rtcConnectedAt ? Date.now() - this.rtcConnectedAt : undefined;
+      const handoff = process.env.RTC_HANDOFF !== "0" && process.env.RTC_HANDOFF !== "false";
+      rootHTTPLogger.info("T9000 RTC proactive refresh — before hub silence cliff", {
+        stationSN: this.getSerial(),
+        afterMs,
+        uptimeMs,
+        mode: handoff ? "handoff" : "hard_close",
+      });
+      this.rtcPollMisses = 0;
+      this.clearRtcPollWatchdog();
+      if (!handoff) {
+        this.rtcTransport.close();
+        return;
+      }
+      this.attemptProactiveRtcHandoff(0);
+    }, afterMs);
   }
 
   /** Poll hub DB while RTC is up — catches events when push notify stops flowing. */
@@ -1989,7 +2859,15 @@ export class Station extends TypedEmitter<StationEvents> {
     if (!this.isStationHomeBaseProfessionalS1()) {
       return;
     }
-    const pollMs = 30_000;
+    const pollMs = Number(process.env.RTC_LIVE_POLL_MS ?? 30_000);
+    // 0 / negative disables (TTL isolation experiments).
+    if (!Number.isFinite(pollMs) || pollMs <= 0) {
+      rootHTTPLogger.info("T9000 RTC periodic live poll disabled", {
+        stationSN: this.getSerial(),
+        pollMs,
+      });
+      return;
+    }
     this.rtcLivePollTimer = setInterval(() => {
       if (!this.isConnected() || !this.rtcTransport?.isConnected()) {
         return;
@@ -2007,34 +2885,25 @@ export class Station extends TypedEmitter<StationEvents> {
     this.clearRtcCatchupTimers();
     const gapMs = this.rtcDisconnectedAt ? Date.now() - this.rtcDisconnectedAt : undefined;
     this.rtcDisconnectedAt = undefined;
+    if (process.env.RTC_RECONNECT_CATCHUP === "0" || process.env.RTC_RECONNECT_CATCHUP === "false") {
+      rootHTTPLogger.info("T9000 RTC reconnect catch-up skipped", {
+        stationSN: this.getSerial(),
+        gapMs,
+      });
+      return;
+    }
     rootHTTPLogger.info("T9000 RTC reconnect catch-up", {
       stationSN: this.getSerial(),
       gapMs,
     });
-    if (!this.hasCommand(CommandName.StationDatabaseQueryLatestInfo)) {
-      return;
-    }
-    const queryLatest = (delayMs: number): void => {
-      const timer = setTimeout(() => {
-        if (!this.isConnected()) {
-          return;
-        }
-        rootHTTPLogger.debug("T9000 RTC catch-up database query", {
-          stationSN: this.getSerial(),
-          delayMs,
-        });
-        this.databaseQueryLatestInfo();
-      }, delayMs);
-      this.rtcCatchupTimers.push(timer);
-    };
-    queryLatest(0);
-    queryLatest(2000);
-    queryLatest(5000);
+    this.runHubFirstPropertySync();
     const refreshTimer = setTimeout(() => {
       if (!this.isConnected()) {
         return;
       }
-      rootHTTPLogger.debug("T9000 RTC catch-up property refresh", { stationSN: this.getSerial() });
+      rootHTTPLogger.debug("T9000 RTC catch-up cloud refresh (after hub poll)", {
+        stationSN: this.getSerial(),
+      });
       void this.api.refreshAllData().catch((err) => {
         const error = ensureError(err);
         rootHTTPLogger.debug("T9000 RTC catch-up cloud refresh failed", {
@@ -2042,8 +2911,7 @@ export class Station extends TypedEmitter<StationEvents> {
           error: getError(error),
         });
       });
-      this.getCameraInfo();
-    }, 3000);
+    }, HUB_FIRST_CLOUD_REFRESH_DELAY_MS);
     this.rtcCatchupTimers.push(refreshTimer);
   }
 
@@ -3065,7 +3933,7 @@ export class Station extends TypedEmitter<StationEvents> {
       value: value,
     });
     if (
-      (device.isFloodLight() && !device.isFloodLightT8425()) ||
+      (device.isFloodLight() && !device.isFloodLightT8425() && !device.isFloodLightT8426()) ||
       device.isSoloCameraSpotlight1080() ||
       device.isSoloCameraSpotlight2k() ||
       device.isSoloCameraSpotlightSolar() ||
@@ -3091,7 +3959,12 @@ export class Station extends TypedEmitter<StationEvents> {
           property: propertyData,
         }
       );
-    } else if (device.isBatteryDoorbellDualE340() || device.isOutdoorPanAndTiltCamera() || device.isFloodLightT8425()) {
+    } else if (
+      device.isBatteryDoorbellDualE340() ||
+      device.isOutdoorPanAndTiltCamera() ||
+      device.isFloodLightT8425() ||
+      device.isFloodLightT8426()
+    ) {
       this.p2pSession.sendCommandWithStringPayload(
         {
           commandType: CommandType.CMD_DOORBELL_SET_PAYLOAD,
@@ -16085,6 +16958,7 @@ export class Station extends TypedEmitter<StationEvents> {
 
   private onDatabaseQueryLatest(returnCode: DatabaseReturnCode, data: Array<DatabaseQueryLatestInfo>): void {
     if (this.rtcTransport?.isConnected()) {
+      this.rtcLastDbPollAckAt = Date.now();
       this.clearRtcPollWatchdog();
       this.rtcPollMisses = 0;
     }

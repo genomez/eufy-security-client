@@ -1,5 +1,5 @@
 import { TypedEmitter } from "tiny-typed-emitter";
-import { existsSync, readFileSync, statSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import * as path from "path";
 import * as util from "util";
 import { Readable } from "stream";
@@ -23,6 +23,7 @@ import {
   DeviceConfig,
 } from "./http/interfaces";
 import { Station } from "./http/station";
+import { HUB_FIRST_CLOUD_REFRESH_DELAY_MS } from "./http/hubAuthoritative";
 import { EventImageCache } from "./http/eventImageCache";
 import { ConfirmInvite, DeviceListResponse, HouseInviteListResponse, Invite, StationListResponse } from "./http/models";
 import {
@@ -140,6 +141,14 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
   private devices: Devices = {};
 
   private readonly P2P_REFRESH_INTERVAL_MIN = 720;
+  /**
+   * Poll hub param 1400 (floodlight) via CMD_CAMERA_INFO.
+   * Override with RTC_FLOODLIGHT_POLL_INTERVAL_MIN (minutes). Default 2.
+   */
+  private readonly FLOODLIGHT_POLL_INTERVAL_MIN = Math.max(
+    1,
+    Number(process.env.RTC_FLOODLIGHT_POLL_INTERVAL_MIN ?? 2)
+  );
 
   private cameraMaxLivestreamSeconds = 30;
   private cameraStationLivestreamTimeout: Map<string, NodeJS.Timeout> = new Map<string, NodeJS.Timeout>();
@@ -154,6 +163,23 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
   private pendingImageFiles = new Map<string, string>();
   /** Last light on/off intent per device — replayed after T9000 WebRTC reconnect. */
   private pendingDeviceLightBySerial = new Map<string, boolean>();
+  /**
+   * Last add-on-confirmed floodlight (manual-switch, param 1400) state per device serial,
+   * persisted to disk. The Eufy cloud device list reports a stale value for this param (local
+   * HA -> P2P toggles never propagate back to the cloud). Hub truth is pulled periodically via
+   * CMD_CAMERA_INFO (param 1400) and from floodlight manual-switch RTC events when available.
+   * On restart, hub truth is applied via CMD_CAMERA_INFO poll — not from this file on device ready.
+   */
+  private deviceLightState = new Map<string, boolean>();
+  private deviceLightStateFile!: string;
+  /**
+   * Per-device last event-image capture time (UTC ISO), published to a Home Assistant
+   * shared folder so the dashboard "last event" sync can read it WITHOUT `docker exec`
+   * (HA Core has no Docker access). Updated whenever the add-on caches a freshly
+   * downloaded event image or restores one on startup. See sync_eufy_snapshot_times.py.
+   */
+  private snapshotTimes = new Map<string, string>();
+  private readonly snapshotTimesFile = "/share/eufy/snapshot_times.json";
   private persistentData: EufySecurityPersistentData = {
     country: "",
     openudid: "",
@@ -171,6 +197,14 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
   private refreshEufySecurityP2PTimeout: {
     [dataType: string]: NodeJS.Timeout;
   } = {};
+  private floodlightPollInterval: {
+    [stationSN: string]: NodeJS.Timeout;
+  } = {};
+  private floodlightPollInitialTimeouts: Map<string, NodeJS.Timeout[]> = new Map();
+  /** Station RTC connect time — used to ignore stale floodlight notify ON after reconnect. */
+  private stationRtcConnectedAt = new Map<string, number>();
+  /** Debounced camera-info polls triggered by motion / deferred notify ON. */
+  private floodlightPollDebounce = new Map<string, NodeJS.Timeout>();
   private deviceSnoozeTimeout: {
     [dataType: string]: NodeJS.Timeout;
   } = {};
@@ -271,6 +305,11 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
     }
 
     rootMainLogger.debug("Loaded persistent data", { persistentData: this.persistentData });
+
+    this.deviceLightStateFile = path.join(this.config.persistentDir, "device_light_state.json");
+    this.loadDeviceLightState();
+    this.loadSnapshotTimes();
+
     try {
       if (this.persistentData.version !== libVersion) {
         const currentVersion = Number.parseFloat(removeLastChar(libVersion, "."));
@@ -384,6 +423,53 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
     this.api.setSerialNumber(this.persistentData.serial_number);
 
     this.syncMegaRtcCredentialsToApi();
+    this.api.setMegaCloudWakeHandler(async () => {
+      try {
+        const mega = await this.getMegaApi();
+        if (!mega.hasValidSession()) {
+          rootMainLogger.debug("v6 cloud wake: no valid mega session, skipping");
+          return;
+        }
+        // App swipe-refresh hits house + devicerelation + things + devicemanage
+        // (Firewalla capture). Mega WAF ~3s/request — sequential via rate limiter.
+        const steps: Array<[string, () => Promise<unknown>]> = [
+          ["get_devs_list", () => mega.getDevsListDecrypted()],
+          [
+            "get_device_relation",
+            () =>
+              mega.callDecrypted("devicerelation", "/app/devicerelation/get_device_list", {
+                attribute: 3,
+              }),
+          ],
+          ["get_things_list", () => mega.getThingsListDecrypted()],
+          [
+            "get_user_mqtt_info",
+            async () => {
+              const info = await mega.getUserMqttInfo();
+              rootMainLogger.info("v6 cloud wake: mqtt endpoint", {
+                endpoint: info?.endpoint_addr,
+                thingName: info?.thing_name,
+              });
+              return info;
+            },
+          ],
+        ];
+        for (const [name, fn] of steps) {
+          try {
+            await fn();
+            rootMainLogger.info(`v6 cloud wake: ${name} ok`);
+          } catch (err) {
+            rootMainLogger.warn(`v6 cloud wake: ${name} failed`, {
+              error: getError(ensureError(err)),
+            });
+          }
+        }
+      } catch (err) {
+        rootMainLogger.warn("v6 cloud wake failed", {
+          error: getError(ensureError(err)),
+        });
+      }
+    });
 
     this.pushService = await PushNotificationService.initialize();
     this.pushService.on("connect", async (token: string) => {
@@ -970,6 +1056,7 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
   }
 
   private onStationConnect(station: Station): void {
+    this.stationRtcConnectedAt.set(station.getSerial(), Date.now());
     this.emit("station connect", station);
     this.refreshP2PData(station);
     void this.getDevicesFromStation(station.getSerial())
@@ -1004,6 +1091,132 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
     setTimeout(() => {
       this.replayPendingDeviceLights(station);
     }, 4000);
+    this.scheduleFloodlightPoll(station);
+  }
+
+  /** Pull floodlight (param 1400) from hub via CMD_CAMERA_INFO — authoritative when RTC push is missing. */
+  private pollFloodlightStates(station: Station): void {
+    if (!station.isConnected()) {
+      return;
+    }
+    if (
+      !station.isStation() &&
+      !(Device.isCamera(station.getDeviceType()) && !Device.isWiredDoorbell(station.getDeviceType()))
+    ) {
+      return;
+    }
+    rootMainLogger.debug("Polling floodlight states via camera info", { stationSN: station.getSerial() });
+    station.getCameraInfo();
+  }
+
+  /** Debounced floodlight poll — used after motion and when notify ON arrives during reconnect grace. */
+  private requestFloodlightPoll(station: Station, reason: string, delayMs = 1500): void {
+    const stationSN = station.getSerial();
+    const existing = this.floodlightPollDebounce.get(stationSN);
+    if (existing !== undefined) {
+      clearTimeout(existing);
+    }
+    this.floodlightPollDebounce.set(
+      stationSN,
+      setTimeout(() => {
+        this.floodlightPollDebounce.delete(stationSN);
+        if (!station.isConnected()) {
+          return;
+        }
+        rootMainLogger.info("Floodlight poll requested", { stationSN, reason });
+        this.pollFloodlightStates(station);
+      }, delayMs)
+    );
+  }
+
+  private isFloodlightNotifyOnInGrace(stationSN: string): boolean {
+    const graceMs = Number(process.env.RTC_FLOODLIGHT_NOTIFY_ON_GRACE_MS ?? 45_000);
+    if (graceMs <= 0) {
+      return false;
+    }
+    const connectedAt = this.stationRtcConnectedAt.get(stationSN);
+    if (connectedAt === undefined) {
+      return false;
+    }
+    return Date.now() - connectedAt < graceMs;
+  }
+
+  private scheduleFloodlightPoll(station: Station): void {
+    const stationSN = station.getSerial();
+    this.clearFloodlightPoll(stationSN);
+    const initialDelaysMs = [0, 2000, 5000, 15000];
+    const initialTimeouts: NodeJS.Timeout[] = [];
+    for (const delayMs of initialDelaysMs) {
+      initialTimeouts.push(
+        setTimeout(() => {
+          if (station.isConnected()) {
+            this.pollFloodlightStates(station);
+          }
+        }, delayMs)
+      );
+    }
+    this.floodlightPollInitialTimeouts.set(stationSN, initialTimeouts);
+    this.floodlightPollInterval[stationSN] = setInterval(() => {
+      if (station.isConnected()) {
+        this.pollFloodlightStates(station);
+      }
+    }, this.FLOODLIGHT_POLL_INTERVAL_MIN * 60 * 1000);
+  }
+
+  private clearFloodlightPoll(stationSN: string): void {
+    if (this.floodlightPollInterval[stationSN] !== undefined) {
+      clearInterval(this.floodlightPollInterval[stationSN]);
+      delete this.floodlightPollInterval[stationSN];
+    }
+    const initialTimeouts = this.floodlightPollInitialTimeouts.get(stationSN);
+    if (initialTimeouts !== undefined) {
+      for (const timeout of initialTimeouts) {
+        clearTimeout(timeout);
+      }
+      this.floodlightPollInitialTimeouts.delete(stationSN);
+    }
+  }
+
+  private coerceDeviceLightValue(value: unknown): boolean | undefined {
+    if (typeof value === "boolean") {
+      return value;
+    }
+    if (value === 1 || value === "1" || value === "true") {
+      return true;
+    }
+    if (value === 0 || value === "0" || value === "false") {
+      return false;
+    }
+    return undefined;
+  }
+
+  private applyPolledFloodlightState(deviceSN: string, values: RawValues, device: Device): void {
+    if (!device.hasProperty(PropertyName.DeviceLight)) {
+      return;
+    }
+    const entry = values[CommandType.CMD_SET_FLOODLIGHT_MANUAL_SWITCH];
+    if (entry === undefined || entry.source !== "p2p") {
+      return;
+    }
+    const polled = this.coerceDeviceLightValue(entry.value);
+    if (polled === undefined) {
+      return;
+    }
+    const current = device.getPropertyValue(PropertyName.DeviceLight) as boolean | undefined;
+    if (current !== polled) {
+      const metadataLight = device.getPropertyMetadata(PropertyName.DeviceLight);
+      device.updateRawProperty(metadataLight.key as number, polled ? "1" : "0", "p2p");
+      rootMainLogger.info("Hub floodlight poll reconciled device light", {
+        deviceSN,
+        previous: current,
+        polled,
+      });
+    }
+    // Mark every successful hub poll as fresh, even when the boolean did not
+    // change. HA verification uses last_updated to reject command-ack state.
+    device.updateProperty(PropertyName.DeviceLight, polled, true);
+    this.pendingDeviceLightBySerial.delete(deviceSN);
+    this.saveDeviceLightState(deviceSN, polled);
   }
 
   private replayPendingDeviceLights(station: Station): void {
@@ -1011,6 +1224,12 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
       return;
     }
     for (const [serial, desired] of [...this.pendingDeviceLightBySerial.entries()]) {
+      // Only replay pending ON. A stale pending OFF (e.g. midnight schedule turn_off without
+      // hub ack, or hub/app turned the light back on) must not force real lights off on reconnect.
+      if (!desired) {
+        this.pendingDeviceLightBySerial.delete(serial);
+        continue;
+      }
       void this.getDevice(serial)
         .then((device) => {
           if (device.getStationSerial() !== station.getSerial()) {
@@ -1034,16 +1253,24 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
   }
 
   private onHubNotifyUpdate(station: Station): void {
-    rootMainLogger.info("Hub notify update received, refreshing cloud data", {
+    const hubConnected = station.isConnected();
+    rootMainLogger.info("Hub notify update received", {
       stationSN: station.getSerial(),
+      hubConnected,
     });
-    this.refreshCloudData();
-    if (station.hasCommand(CommandName.StationDatabaseQueryLatestInfo)) {
+    if (hubConnected) {
+      station.runHubFirstPropertySync();
       setTimeout(() => {
-        if (station.isConnected()) {
-          station.databaseQueryLatestInfo();
-        }
-      }, 2000);
+        this.refreshCloudData().catch((err) => {
+          const error = ensureError(err);
+          rootMainLogger.error("Deferred cloud refresh after hub notify failed", {
+            error: getError(error),
+            stationSN: station.getSerial(),
+          });
+        });
+      }, HUB_FIRST_CLOUD_REFRESH_DELAY_MS);
+    } else {
+      void this.refreshCloudData();
     }
   }
 
@@ -1098,6 +1325,10 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
             curVideoState,
             previousVideoState,
           });
+          // Motion often turns FLC lamps on without a trusted HA state update — poll param 1400.
+          if (Device.isFloodLight(device.getDeviceType())) {
+            this.requestFloodlightPoll(station, `motion_start:${deviceSn}`);
+          }
         } else {
           rootMainLogger.debug("HomeBase S1 grid video state motion", {
             stationSN: station.getSerial(),
@@ -1132,6 +1363,13 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
 
   private onStationClose(station: Station): void {
     this.emit("station close", station);
+    this.stationRtcConnectedAt.delete(station.getSerial());
+    const debounce = this.floodlightPollDebounce.get(station.getSerial());
+    if (debounce !== undefined) {
+      clearTimeout(debounce);
+      this.floodlightPollDebounce.delete(station.getSerial());
+    }
+    this.clearFloodlightPoll(station.getSerial());
     for (const device_sn of this.cameraStationLivestreamTimeout.keys()) {
       this.getDevice(device_sn)
         .then((device: Device) => {
@@ -1529,6 +1767,7 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
     this.getDevice(deviceSN)
       .then((device: Device) => {
         device.updateRawProperties(values);
+        this.applyPolledFloodlightState(deviceSN, values, device);
       })
       .catch((err) => {
         const error = ensureError(err);
@@ -1649,6 +1888,92 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
     } catch (err) {
       const error = ensureError(err);
       rootMainLogger.error("WritePersistentData Error", { error: getError(error) });
+    }
+  }
+
+  private loadDeviceLightState(): void {
+    try {
+      if (statSync(this.deviceLightStateFile).isFile()) {
+        const raw = JSON.parse(readFileSync(this.deviceLightStateFile, "utf8")) as Record<string, unknown>;
+        rootMainLogger.debug("Discarding persisted device light state on startup (hub poll is authoritative)", {
+          entries: raw,
+        });
+      }
+    } catch (err) {
+      const error = ensureError(err);
+      rootMainLogger.debug("No persisted device light state found", { error: getError(error) });
+    }
+    this.deviceLightState.clear();
+  }
+
+  private saveDeviceLightState(serial: string, value: boolean): void {
+    if (this.deviceLightState.get(serial) === value) {
+      return;
+    }
+    this.deviceLightState.set(serial, value);
+    try {
+      writeFileSync(this.deviceLightStateFile, JSON.stringify(Object.fromEntries(this.deviceLightState)));
+      rootMainLogger.debug("Persisted device light state", { deviceSN: serial, value });
+    } catch (err) {
+      const error = ensureError(err);
+      rootMainLogger.error("Save device light state error", { error: getError(error), deviceSN: serial, value });
+    }
+  }
+
+  private loadSnapshotTimes(): void {
+    try {
+      if (statSync(this.snapshotTimesFile).isFile()) {
+        const raw = JSON.parse(readFileSync(this.snapshotTimesFile, "utf8")) as Record<string, unknown>;
+        for (const [serial, value] of Object.entries(raw)) {
+          if (typeof value === "string" && value !== "") {
+            this.snapshotTimes.set(serial, value);
+          }
+        }
+        rootMainLogger.debug("Loaded published snapshot times", { entries: this.snapshotTimes.size });
+      }
+    } catch (err) {
+      const error = ensureError(err);
+      rootMainLogger.debug("No published snapshot times found", { error: getError(error) });
+    }
+  }
+
+  /**
+   * Convert an event-image filename's embedded YYYYMMDDHHMMSS to a *naive* ISO string
+   * (no timezone offset). The digits are the station's local wall-clock time, but this
+   * container runs in UTC and does not know the site timezone, so we publish the naive
+   * value and let the sync (which runs in HA Core and can read HA's configured
+   * time_zone) localize it. See sync_eufy_snapshot_times.py.
+   */
+  private captureIsoFromFile(file: string): string | undefined {
+    const match = file.match(/(\d{14})_/);
+    if (!match) {
+      return undefined;
+    }
+    const s = match[1];
+    return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T${s.slice(8, 10)}:${s.slice(10, 12)}:${s.slice(12, 14)}`;
+  }
+
+  /**
+   * Publish the capture time of a device's latest event image to the HA shared folder.
+   * Only advances forward so a startup cache-restore never regresses a fresher value.
+   */
+  private publishSnapshotTime(serial: string, file: string): void {
+    const iso = this.captureIsoFromFile(file);
+    if (!iso) {
+      return;
+    }
+    const previous = this.snapshotTimes.get(serial);
+    if (previous !== undefined && previous >= iso) {
+      return;
+    }
+    this.snapshotTimes.set(serial, iso);
+    try {
+      mkdirSync(path.dirname(this.snapshotTimesFile), { recursive: true });
+      writeFileSync(this.snapshotTimesFile, JSON.stringify(Object.fromEntries(this.snapshotTimes)));
+      rootMainLogger.debug("Published snapshot time", { deviceSN: serial, capture: iso });
+    } catch (err) {
+      const error = ensureError(err);
+      rootMainLogger.debug("Publish snapshot time error", { error: getError(error), deviceSN: serial, capture: iso });
     }
   }
 
@@ -2729,10 +3054,19 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
           });
         }
       }
+      // A successful floodlight command only means the hub accepted the request.
+      // Keep the HA property unchanged until the follow-up hub poll reports the
+      // device property; otherwise HA can show an optimistic OFF while the lamp
+      // is still physically on.
+      const isFloodlightLightCommand =
+        result.customData?.property?.name === PropertyName.DeviceLight &&
+        (result.command_type === CommandType.CMD_SET_FLOODLIGHT_MANUAL_SWITCH ||
+          result.command_type === CommandType.CMD_DOORBELL_SET_PAYLOAD);
       this.getStationDevice(station.getSerial(), result.channel)
         .then((device: Device) => {
           if (
-            (result.customData !== undefined &&
+            !isFloodlightLightCommand &&
+            ((result.customData !== undefined &&
               result.customData.property !== undefined &&
               !device.isLockWifiR10() &&
               !device.isLockWifiR20() &&
@@ -2753,7 +3087,7 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
                 device.isLockWifiT8510P() ||
                 device.isLockWifiT8520P() ||
                 device.isLockWifiT85L0()) &&
-              result.command_type !== CommandType.CMD_DOORLOCK_SET_PUSH_MODE)
+              result.command_type !== CommandType.CMD_DOORLOCK_SET_PUSH_MODE))
           ) {
             if (device.hasProperty(result.customData.property.name)) {
               const metadata = device.getPropertyMetadata(result.customData.property.name);
@@ -3068,6 +3402,7 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
       if (ready && !name.startsWith("hidden-")) {
         this.emit("device property changed", device, name, value);
       }
+      // Floodlight persistence is hub-authoritative only (poll + manual-switch events).
       if (
         name === PropertyName.DeviceRTSPStream &&
         (value as boolean) === true &&
@@ -3228,6 +3563,7 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
   }
 
   private onDeviceReady(device: Device): void {
+    // Floodlight state: hub poll (scheduleFloodlightPoll) applies truth ~6s after connect.
     try {
       if (
         device.getPropertyValue(PropertyName.DeviceRTSPStream) !== undefined &&
@@ -3330,22 +3666,17 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
   }
 
   private onFloodlightManualSwitch(station: Station, channel: number, enabled: boolean): void {
-    this.getStationDevice(station.getSerial(), channel)
-      .then((device: Device) => {
-        if (device.hasProperty(PropertyName.DeviceLight)) {
-          const metadataLight = device.getPropertyMetadata(PropertyName.DeviceLight);
-          device.updateRawProperty(metadataLight.key as number, enabled ? "1" : "0", "p2p");
-        }
-      })
-      .catch((err) => {
-        const error = ensureError(err);
-        rootMainLogger.error(`Station floodlight manual switch error`, {
-          error: getError(error),
-          stationSN: station.getSerial(),
-          channel: channel,
-          enabled: enabled,
-        });
-      });
+    // A command ACK and a notify payload are not authoritative device state.
+    // The same event is produced for both, so always reconcile through the
+    // hub's camera-info property poll before changing the HA light entity.
+    const reconnectGrace = enabled && this.isFloodlightNotifyOnInGrace(station.getSerial());
+    rootMainLogger.info("Floodlight manual switch received — polling hub before applying", {
+      stationSN: station.getSerial(),
+      channel,
+      enabled,
+      reconnectGrace,
+    });
+    this.requestFloodlightPoll(station, "manual_switch_event", reconnectGrace ? 500 : 1500);
   }
 
   private onAuthTokenInvalidated(): void {
@@ -3967,6 +4298,7 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
     }
     device.updateProperty(PropertyName.DevicePicture, picture, true);
     this.eventImageCache?.save(device.getSerial(), file, picture);
+    this.publishSnapshotTime(device.getSerial(), file);
     this.pendingImageFiles.delete(file);
   }
 
@@ -3989,6 +4321,7 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
       device.updateProperty(PropertyName.DevicePictureUrl, cached.file, true);
     }
     device.updateProperty(PropertyName.DevicePicture, cached.picture, true);
+    this.publishSnapshotTime(device.getSerial(), cached.file);
     rootMainLogger.info("Restored cached event image", {
       deviceSN: device.getSerial(),
       file: cached.file,

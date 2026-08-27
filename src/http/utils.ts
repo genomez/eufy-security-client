@@ -1016,9 +1016,6 @@ export const loadEventImage = function (
     loadImageOverP2P(station, device, device.getSerial(), p2pTimeouts);
   } else {
     if (!isEmpty(message.pic_url)) {
-      if (station.isStationHomeBaseProfessionalS1()) {
-        loadImageOverP2P(station, device, device.getSerial(), p2pTimeouts, 3);
-      }
       getImage(api, device.getSerial(), message.pic_url!)
         .then((image) => {
           if (image.data.length > 0) {

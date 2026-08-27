@@ -1,19 +1,76 @@
 import { rootHTTPLogger, rootP2PLogger } from "../logging";
 import { parseJSON } from "../utils";
 import { PushMessage } from "../push/models";
-import { CommandResult } from "../p2p/models";
+import { CmdCameraInfoResponse, CommandResult, StorageInfoBodyHB3, StorageInfoHB3 } from "../p2p/models";
 import { CommandType, ErrorCode } from "../p2p/types";
 import { parsePortalHeader, parsePortalPacket } from "./rtcPacket";
 import { dispatchPortalDatabaseInbound, StationDatabaseInboundSession } from "./stationDatabaseInbound";
+import { RtcInboundDiagEntry } from "./rtcInboundDiagnostics";
 
 /** Minimal session surface for RTC inbound dispatch. */
 export interface RtcInboundSession {
   getStationSn(): string;
   getP2pDid(): string | undefined;
   emit(event: "command", result: CommandResult): boolean;
+  emit(event: "camera info", cameraInfo: CmdCameraInfoResponse): boolean;
   emit(event: "push notification", message: PushMessage): boolean;
   emit(event: "floodlight manual switch", channel: number, enabled: boolean): boolean;
   emit(event: "hub notify update"): boolean;
+  emit(event: "storage info hb3", channel: number, storageInfo: StorageInfoBodyHB3): boolean;
+  /** Optional hook: hub returned a successful command-channel ack (e.g. CMD_PING). */
+  notifyRtcPollAck?(commandID: number, errCode: number): void;
+  recordRtcInboundDiagnostic?(entry: RtcInboundDiagEntry): void;
+}
+
+function recordDiag(session: RtcInboundSession, entry: RtcInboundDiagEntry): void {
+  session.recordRtcInboundDiagnostic?.(entry);
+}
+
+function isSuccessfulPortalAck(errCode: number | undefined): boolean {
+  return errCode === undefined || errCode === 0;
+}
+
+function notifyRtcPollAck(session: RtcInboundSession, commandID: number, errCode: number | undefined): void {
+  if (!isSuccessfulPortalAck(errCode)) {
+    return;
+  }
+  session.notifyRtcPollAck?.(commandID, errCode ?? 0);
+}
+
+function isCameraInfoResponse(value: unknown): value is CmdCameraInfoResponse {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const candidate = value as { params?: unknown; db_bypass_str?: unknown };
+  return Array.isArray(candidate.params) || Array.isArray(candidate.db_bypass_str);
+}
+
+function emitCameraInfoIfPresent(session: RtcInboundSession, value: unknown): boolean {
+  const candidates: unknown[] = [value];
+  if (typeof value === "object" && value !== null && "payload" in value) {
+    candidates.push((value as { payload?: unknown }).payload);
+  }
+  for (const candidate of candidates) {
+    const parsed = typeof candidate === "string" ? parseJSON(candidate, rootP2PLogger) : candidate;
+    if (!isCameraInfoResponse(parsed)) {
+      continue;
+    }
+    const cameraInfo = parsed as CmdCameraInfoResponse;
+    rootHTTPLogger.info("RtcInbound camera info payload", {
+      stationSN: session.getStationSn(),
+      params: Array.isArray(cameraInfo.params) ? cameraInfo.params.length : 0,
+      dbBypassParams: Array.isArray(cameraInfo.db_bypass_str) ? cameraInfo.db_bypass_str.length : 0,
+    });
+    session.emit("camera info", cameraInfo);
+    recordDiag(session, {
+      kind: "camera_info",
+      linkType: 3,
+      commandID: CommandType.CMD_CAMERA_INFO,
+      bytes: typeof candidate === "string" ? candidate.length : 0,
+    });
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -37,6 +94,9 @@ export function dispatchRtcInbound(session: RtcInboundSession, buf: Buffer, link
         cmd: (parsed as { cmd?: number }).cmd,
         bytes: buf.length,
       });
+      if (emitCameraInfoIfPresent(session, parsed)) {
+        return;
+      }
       handleNotifyJson(session, 0, parsed);
       if (
         dispatchPortalDatabaseInbound(
@@ -49,6 +109,12 @@ export function dispatchRtcInbound(session: RtcInboundSession, buf: Buffer, link
       ) {
         return;
       }
+      recordDiag(session, {
+        kind: "raw_json",
+        linkType,
+        commandID: (parsed as { cmd?: number }).cmd,
+        bytes: buf.length,
+      });
       return;
     }
   }
@@ -77,14 +143,6 @@ function dispatchPortalRtcInbound(session: RtcInboundSession, buf: Buffer, linkT
     }
     const body = buf.subarray(16);
     const enabled = body.length >= 4 && body.readUInt32LE(0) === 1;
-    if (enabled) {
-      rootP2PLogger.debug("RtcInbound floodlight 20-byte ON ignored", {
-        stationSN: session.getStationSn(),
-        channel: header.channelID,
-        linkType,
-      });
-      return;
-    }
     rootP2PLogger.info("RtcInbound floodlight manual switch", {
       stationSN: session.getStationSn(),
       channel: header.channelID,
@@ -96,6 +154,13 @@ function dispatchPortalRtcInbound(session: RtcInboundSession, buf: Buffer, linkT
 
   const parsed = parsePortalPacket(buf, linkType) ?? parsePortalPacket(buf, linkType === 1 ? 3 : 1);
   if (!parsed) {
+    recordDiag(session, {
+      kind: "unhandled_portal",
+      linkType,
+      commandID: header.commandID,
+      bytes: buf.length,
+      detail: "parsePortalPacket failed",
+    });
     rootP2PLogger.debug("RtcInbound unhandled portal frame", {
       stationSN: session.getStationSn(),
       linkType,
@@ -105,6 +170,16 @@ function dispatchPortalRtcInbound(session: RtcInboundSession, buf: Buffer, linkT
       bytes: buf.length,
     });
     return;
+  }
+
+  // CMD_CAMERA_INFO is acknowledged on the command channel, then its large
+  // JSON payload arrives as a non-response portal packet on the notify path.
+  // It has no `cmd` wrapper, so the generic notify dispatcher drops it.
+  if (header.commandID === CommandType.CMD_CAMERA_INFO && header.isResponse !== 1) {
+    const cameraInfoPacket = parsePortalPacket(buf, 3);
+    if (cameraInfoPacket !== null && emitCameraInfoIfPresent(session, cameraInfoPacket.data)) {
+      return;
+    }
   }
 
   if (linkType === 1 && header.isResponse === 1) {
@@ -122,6 +197,43 @@ function dispatchPortalRtcInbound(session: RtcInboundSession, buf: Buffer, linkT
     ) {
       return;
     }
+    if (isSuccessfulPortalAck(parsed.errCode)) {
+      notifyRtcPollAck(session, parsed.commandID, parsed.errCode);
+      const kind = parsed.commandID === CommandType.CMD_PING ? "ping_ack" : "cmd_ack";
+      recordDiag(session, {
+        kind,
+        linkType,
+        commandID: parsed.commandID,
+        errCode: parsed.errCode,
+      });
+      if (parsed.commandID === CommandType.CMD_PING) {
+        rootP2PLogger.debug("RtcInbound ping ack", {
+          stationSN: session.getStationSn(),
+          channel: header.channelID,
+          segmen: parsed.segmen,
+        });
+      } else if (parsed.commandID === CommandType.CMD_CAMERA_INFO) {
+        rootP2PLogger.debug("RtcInbound camera info ack", {
+          stationSN: session.getStationSn(),
+          channel: header.channelID,
+          segmen: parsed.segmen,
+        });
+      } else {
+        rootP2PLogger.debug("RtcInbound command ack", {
+          stationSN: session.getStationSn(),
+          commandID: parsed.commandID,
+          channel: header.channelID,
+          segmen: parsed.segmen,
+        });
+      }
+      return;
+    }
+    recordDiag(session, {
+      kind: "unmatched",
+      linkType,
+      commandID: parsed.commandID,
+      errCode: parsed.errCode,
+    });
     rootP2PLogger.info("RtcInbound unmatched command response", {
       stationSN: session.getStationSn(),
       commandID: parsed.commandID,
@@ -184,21 +296,14 @@ function handleLateCommandResponse(
       const value = nested?.data?.value;
       if (value !== undefined) {
         const enabled = value === 1;
-        if (!enabled) {
-          rootP2PLogger.info("RtcInbound late floodlight ack (1700)", {
-            stationSN: session.getStationSn(),
-            channel,
-            enabled,
-            segmen: parsed.segmen,
-          });
-          session.emit("floodlight manual switch", channel, enabled);
-        } else {
-          rootP2PLogger.debug("RtcInbound late floodlight ack ON ignored (1700)", {
-            stationSN: session.getStationSn(),
-            channel,
-            segmen: parsed.segmen,
-          });
-        }
+        rootP2PLogger.info("RtcInbound late floodlight ack (1700)", {
+          stationSN: session.getStationSn(),
+          channel,
+          enabled,
+          segmen: parsed.segmen,
+        });
+        // Reconnect-stale ON filtering is applied in EufySecurity.onFloodlightManualSwitch.
+        session.emit("floodlight manual switch", channel, enabled);
         return true;
       }
     }
@@ -208,21 +313,13 @@ function handleLateCommandResponse(
     const body = parsed.data as { value?: number } | undefined;
     if (body?.value !== undefined) {
       const enabled = body.value === 1;
-      if (!enabled) {
-        rootP2PLogger.info("RtcInbound late floodlight ack (1400)", {
-          stationSN: session.getStationSn(),
-          channel,
-          enabled,
-          segmen: parsed.segmen,
-        });
-        session.emit("floodlight manual switch", channel, enabled);
-      } else {
-        rootP2PLogger.debug("RtcInbound late floodlight ack ON ignored (1400)", {
-          stationSN: session.getStationSn(),
-          channel,
-          segmen: parsed.segmen,
-        });
-      }
+      rootP2PLogger.info("RtcInbound late floodlight ack (1400)", {
+        stationSN: session.getStationSn(),
+        channel,
+        enabled,
+        segmen: parsed.segmen,
+      });
+      session.emit("floodlight manual switch", channel, enabled);
       return true;
     }
   }
@@ -308,25 +405,48 @@ function handleNotifyJson(session: RtcInboundSession, channel: number, data: unk
   }
 
   // Nested command notify with return code (e.g. 1700/1400 floodlight result).
-  // Notify-channel ON is often stale after reconnect; trust OFF and command responses.
+  // Emit ON and OFF; EufySecurity applies a short post-reconnect grace so stale ON
+  // bursts after RTC connect do not flip HA until hub truth can be polled.
   if (cmd === CommandType.CMD_SET_FLOODLIGHT_MANUAL_SWITCH) {
     const payload = json.payload as { data?: { value?: number } } | undefined;
     const value = payload?.data?.value;
     if (value !== undefined) {
       const enabled = value === 1;
-      if (enabled) {
-        rootP2PLogger.debug("RtcInbound floodlight notify ON ignored", {
-          stationSN: session.getStationSn(),
-          channel,
-        });
-        return;
-      }
       rootP2PLogger.info("RtcInbound floodlight notify payload", {
         stationSN: session.getStationSn(),
         channel,
         enabled,
       });
       session.emit("floodlight manual switch", channel, enabled);
+    }
+    return;
+  }
+
+  // HB3 / T9000 storage info — arrives as CMD_NOTIFY_PAYLOAD (1351) on notify SCTP
+  // after an empty CMD_SET_PAYLOAD ack for nested 1307 (same shape as classic P2P).
+  if (cmd === CommandType.CMD_STORAGE_INFO_HB3) {
+    const payload = json.payload as StorageInfoHB3 | StorageInfoBodyHB3 | undefined;
+    const body =
+      payload && typeof payload === "object" && "emmc_info" in payload
+        ? (payload as StorageInfoBodyHB3)
+        : (payload as StorageInfoHB3 | undefined)?.body;
+    if (body && (body.emmc_info !== undefined || body.hdd_info !== undefined)) {
+      rootP2PLogger.info("RtcInbound storage info HB3", {
+        stationSN: session.getStationSn(),
+        channel,
+        hasEmmc: body.emmc_info !== undefined,
+        hasHdd: body.hdd_info !== undefined,
+        emmcUsedPercent: body.emmc_info?.data_used_percent,
+        hddUsedPercent: (body.hdd_info as { data_used_percent?: number } | undefined)?.data_used_percent,
+      });
+      session.emit("storage info hb3", channel, body);
+    } else {
+      rootP2PLogger.warn("RtcInbound storage info HB3 missing body", {
+        stationSN: session.getStationSn(),
+        channel,
+        payloadKeys:
+          payload && typeof payload === "object" ? Object.keys(payload as object).slice(0, 20) : typeof payload,
+      });
     }
     return;
   }
@@ -338,9 +458,9 @@ function handleNotifyJson(session: RtcInboundSession, channel: number, data: unk
   });
 }
 
-/** Emit immediate command success for T9000 RTC guard mode (hub applies without timely ack). */
-export function shouldOptimisticRtcPropertySuccess(nestedCommandType?: number): boolean {
-  return nestedCommandType === CommandType.CMD_SET_ARMING;
+/** Do not optimistically ack guard mode — HA must reflect hub state, not assume success. */
+export function shouldOptimisticRtcPropertySuccess(_nestedCommandType?: number): boolean {
+  return false;
 }
 
 export function optimisticRtcReturnCode(): number {

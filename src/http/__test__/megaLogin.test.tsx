@@ -30,18 +30,20 @@ type MegaStub = Partial<
 function makeCtx(mega: MegaStub, opts?: { getMegaThrows?: boolean }) {
   const emit = jest.fn();
   const writePersistentData = jest.fn();
+  const syncMegaRtcCredentialsToApi = jest.fn();
   const persistentData: Record<string, unknown> = {};
   const ctx = {
     config: { username: "a@b.c", password: "pw", country: "fr" },
     persistentData,
     emit,
     writePersistentData,
+    syncMegaRtcCredentialsToApi,
     getMegaApi: jest.fn(async () => {
       if (opts?.getMegaThrows) throw new Error("init failed");
       return mega as MegaHTTPApi;
     }),
   } as unknown as EufySecurity;
-  return { ctx, emit, writePersistentData, persistentData };
+  return { ctx, emit, writePersistentData, syncMegaRtcCredentialsToApi, persistentData };
 }
 
 const baseMega = (over: MegaStub): MegaStub => ({
@@ -121,10 +123,11 @@ describe("EufySecurity.loginMega", () => {
       login: jest.fn().mockResolvedValue({ code: 0 }),
       exportSession: jest.fn().mockReturnValue({ ab: "fr", openudid: "x", cloud_token: "t" }),
     });
-    const { ctx, writePersistentData, persistentData } = makeCtx(mega);
+    const { ctx, writePersistentData, syncMegaRtcCredentialsToApi, persistentData } = makeCtx(mega);
     await expect(loginMega(ctx, "123456")).resolves.toBe("ok");
     expect(mega.exportSession).toHaveBeenCalled();
     expect(persistentData.megaApi).toEqual({ ab: "fr", openudid: "x", cloud_token: "t" });
     expect(writePersistentData).toHaveBeenCalled();
+    expect(syncMegaRtcCredentialsToApi).toHaveBeenCalledWith(persistentData.megaApi);
   });
 });

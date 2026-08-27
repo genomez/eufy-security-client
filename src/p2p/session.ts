@@ -35,6 +35,11 @@ import { portalPacketFromP2PMessage, RtcCommandPending, RtcCommandTransport } fr
 import { dispatchRtcInbound, shouldOptimisticRtcPropertySuccess, optimisticRtcReturnCode, RtcInboundSession, applyFloodlightStateFromAck } from "../rtc/rtcInbound";
 import { dispatchPortalDatabaseInbound, StationDatabaseInboundSession } from "../rtc/stationDatabaseInbound";
 import {
+  RtcInboundDiagEntry,
+  RtcInboundDiagnostics,
+  RtcInboundDiagnosticsSnapshot,
+} from "../rtc/rtcInboundDiagnostics";
+import {
   sendMessage,
   hasHeader,
   buildCheckCamPayload,
@@ -151,6 +156,15 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
   private readonly MAX_GATEWAY_COMMAND_RESULT_WAIT = 5 * 1000;
   private readonly MAX_CONNECTION_TIMEOUT = 25 * 1000;
   private readonly MAX_AKNOWLEDGE_TIMEOUT = 5 * 1000;
+  // Command-ack timeout for the T9000 RTC bridge. The hub's ack for some commands (notably the
+  // floodlight manual switch) can take ~6s on a freshly reconnected session — longer than the
+  // legacy 5s ack window — which made a still-in-flight ack land after the pending command had
+  // already timed out (return code -133), so the confirmed light state never reached HA. Give RTC
+  // acks a generous window; normal acks still resolve in well under a second.
+  private readonly RTC_COMMAND_ACK_TIMEOUT = Math.max(
+    5000,
+    Number(process.env.RTC_COMMAND_ACK_TIMEOUT_MS ?? "12000") || 12000
+  );
   private readonly MAX_LOOKUP_TIMEOUT = 20 * 1000;
   private readonly LOCAL_LOOKUP_RETRY_TIMEOUT = 1 * 1000;
   private readonly LOOKUP_RETRY_TIMEOUT = 1 * 1000;
@@ -272,6 +286,18 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
   /** T9000 WebRTC command path (replaces UDP P2P when active). */
   private rtcTransport?: RtcCommandTransport;
   private readonly rtcPending = new RtcCommandPending();
+  /** Wall-clock of the last inbound RTC frame — liveness signal for the stale-session watchdog. */
+  private lastRtcInboundAt = 0;
+  private readonly rtcInboundDiagnostics = new RtcInboundDiagnostics();
+  private rtcPollAckListener?: (commandID: number, errCode: number) => void;
+
+  public setRtcPollAckListener(listener: (commandID: number, errCode: number) => void): void {
+    this.rtcPollAckListener = listener;
+  }
+
+  public notifyRtcPollAck(commandID: number, errCode: number): void {
+    this.rtcPollAckListener?.(commandID, errCode);
+  }
   /** When true, never start legacy UDP P2P — commands wait for WebRTC reconnect. */
   private rtcCommandOnly = false;
 
@@ -665,10 +691,32 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
   }
 
   public handleRtcIncoming(data: Buffer, linkType = 1): void {
+    const at = Date.now();
+    this.lastRtcInboundAt = at;
+    this.rtcInboundDiagnostics.noteInbound(at);
     if (this.rtcPending.handleIncoming(data, linkType)) {
+      this.rtcInboundDiagnostics.record({ kind: "pending_match", linkType, bytes: data.length }, at);
+      this.notifyRtcPollAck(0, 0);
       return;
     }
     dispatchRtcInbound(this as unknown as RtcInboundSession, data, linkType);
+  }
+
+  /** Ms since the last inbound RTC frame, or Infinity if none seen yet. */
+  public rtcInboundIdleMs(): number {
+    return this.lastRtcInboundAt === 0 ? Infinity : Date.now() - this.lastRtcInboundAt;
+  }
+
+  public resetRtcInboundDiagnostics(): void {
+    this.rtcInboundDiagnostics.reset();
+  }
+
+  public recordRtcInboundDiagnostic(entry: RtcInboundDiagEntry): void {
+    this.rtcInboundDiagnostics.record(entry);
+  }
+
+  public getRtcInboundDiagnostics(): RtcInboundDiagnosticsSnapshot {
+    return this.rtcInboundDiagnostics.snapshot();
   }
 
   private _startConnectTimeout(): void {
@@ -980,6 +1028,28 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
       this.sendQueue.unshift(message);
       return;
     }
+    // TTL isolation: drop non-ping RTC commands unless /tmp/rtc_allow_cmds exists (probe window).
+    if (process.env.RTC_PING_ONLY === "1" || process.env.RTC_PING_ONLY === "true") {
+      const commandType = message.p2pCommand.commandType;
+      const isKeepalive =
+        commandType === CommandType.CMD_PING || commandType === CommandType.CMD_GET_DEVICE_PING;
+      let probeAllow = false;
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        probeAllow = require("fs").existsSync("/tmp/rtc_allow_cmds");
+      } catch {
+        probeAllow = false;
+      }
+      if (!isKeepalive && !probeAllow) {
+        rootP2PLogger.info("RTC_PING_ONLY dropped non-ping command", {
+          stationSN: this.rawStation.station_sn,
+          commandType,
+          nestedCommandType: message.nestedCommandType,
+        });
+        this.sendQueuedMessage();
+        return;
+      }
+    }
     const packet = portalPacketFromP2PMessage(message, transport.adminUserId);
     if (!packet) {
       rootP2PLogger.warn("RtcCommandBridge could not encode command", {
@@ -1060,7 +1130,7 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
       message.p2pCommand.commandType,
       message.p2pCommand.channel ?? 0,
       message.nestedCommandType,
-      this.MAX_AKNOWLEDGE_TIMEOUT,
+      this.RTC_COMMAND_ACK_TIMEOUT,
       (returnCode, parsed) => {
         const channel = message.p2pCommand.channel ?? 0;
         if (
@@ -2985,9 +3055,7 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
               enabled: enabled,
               payload: data.toString(),
             });
-            if (!enabled) {
-              this.emit("floodlight manual switch", message.channel, enabled);
-            }
+            this.emit("floodlight manual switch", message.channel, enabled);
           } catch (err) {
             const error = ensureError(err);
             rootP2PLogger.error(
@@ -4576,7 +4644,9 @@ export class P2PClientProtocol extends TypedEmitter<P2PClientProtocolEvents> {
       this._clearRtcKeepaliveTimeout();
       return;
     }
-    this.sendCommandPing(Station.CHANNEL);
+    const pingChannelEnv = Number(process.env.RTC_PING_CHANNEL ?? Station.CHANNEL);
+    const pingChannel = Number.isFinite(pingChannelEnv) ? pingChannelEnv : Station.CHANNEL;
+    this.sendCommandPing(pingChannel);
     this.rtcKeepaliveTimeout = setTimeout(() => {
       this.scheduleRtcKeepalive();
     }, this.getHeartbeatInterval());
