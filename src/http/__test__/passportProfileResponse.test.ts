@@ -22,7 +22,16 @@ describe("passport profile response compatibility", () => {
   });
 
   it.each([
-    { code: 200, msg: "", data: "direct-code-200" },
+    { code: 200, msg: "", data: "flat-regional-ciphertext" },
+    { code: 200, data: "flat-regional-ciphertext" },
+  ])("extracts the exact flat code-200 ciphertext", (response) => {
+    expect(extractPassportProfileCiphertext(response)).toBe("flat-regional-ciphertext");
+  });
+
+  it.each([
+    { code: 200, msg: "unexpected", data: "direct-code-200" },
+    { code: 200, msg: "", data: "" },
+    { code: 200, msg: "", data: "   " },
     { code: 200, msg: "unexpected", data: { code: 200, msg: "", data: "ciphertext" } },
     { code: 200, msg: "", data: { code: 0, msg: "", data: "ciphertext" } },
     { code: 200, msg: "", data: { code: 200, msg: "error", data: "ciphertext" } },
@@ -47,6 +56,22 @@ describe("passport profile response compatibility", () => {
       innerDataType: "string",
     });
     expect(JSON.stringify(description)).not.toContain("sensitive-ciphertext");
+  });
+
+  it("describes the flat envelope without exposing ciphertext", () => {
+    const description = describePassportProfileEnvelope({
+      code: 200,
+      msg: "",
+      data: "sensitive-flat-ciphertext",
+    });
+
+    expect(description).toEqual({
+      outerCode: 200,
+      outerDataType: "string",
+      innerCode: undefined,
+      innerDataType: undefined,
+    });
+    expect(JSON.stringify(description)).not.toContain("sensitive-flat-ciphertext");
   });
 
   it("requires stable identity fields in decrypted profiles", () => {
