@@ -24,8 +24,9 @@ const hasExpectedMessage = (value: UnknownRecord): boolean => value.msg === unde
  * Return the encrypted profile payload from a known passport-profile envelope.
  *
  * The canonical API response uses code 0 with the ciphertext directly in data.
- * Some EU responses use a narrow HTTP-style wrapper with code 200 at both
- * levels. Do not treat arbitrary code-200 responses as successful.
+ * Some EU responses use narrow HTTP-style wrappers with code 200 and the
+ * ciphertext either directly in data or inside a second code-200 envelope.
+ * Do not treat arbitrary code-200 responses as successful.
  */
 export const extractPassportProfileCiphertext = (responseData: unknown): string | undefined => {
   if (!isRecord(responseData)) return undefined;
@@ -34,7 +35,15 @@ export const extractPassportProfileCiphertext = (responseData: unknown): string 
     return responseData.data;
   }
 
-  if (responseData.code !== 200 || !hasExpectedMessage(responseData) || !isRecord(responseData.data)) {
+  if (responseData.code !== 200 || !hasExpectedMessage(responseData)) {
+    return undefined;
+  }
+
+  if (typeof responseData.data === "string" && responseData.data.trim().length > 0) {
+    return responseData.data;
+  }
+
+  if (!isRecord(responseData.data)) {
     return undefined;
   }
 
