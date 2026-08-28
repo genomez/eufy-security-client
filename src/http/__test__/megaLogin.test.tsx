@@ -32,9 +32,11 @@ function makeCtx(mega: MegaStub, opts?: { getMegaThrows?: boolean }) {
   const emit = jest.fn();
   const writePersistentData = jest.fn();
   const syncMegaRtcCredentialsToApi = jest.fn();
+  const getMegaRtcCredentials = jest.fn().mockReturnValue(null);
   const persistentData: Record<string, unknown> = {};
   const ctx = {
     config: { username: "a@b.c", password: "pw", country: "fr" },
+    api: { getMegaRtcCredentials },
     persistentData,
     emit,
     writePersistentData,
@@ -44,7 +46,14 @@ function makeCtx(mega: MegaStub, opts?: { getMegaThrows?: boolean }) {
       return mega as MegaHTTPApi;
     }),
   } as unknown as EufySecurity;
-  return { ctx, emit, writePersistentData, syncMegaRtcCredentialsToApi, persistentData };
+  return {
+    ctx,
+    emit,
+    writePersistentData,
+    syncMegaRtcCredentialsToApi,
+    getMegaRtcCredentials,
+    persistentData,
+  };
 }
 
 const baseMega = (over: MegaStub): MegaStub => ({
@@ -67,9 +76,17 @@ describe("EufySecurity.loginMega", () => {
 
   it("short-circuits to ok when a valid session already exists", async () => {
     const mega = baseMega({ hasValidSession: () => true, login: jest.fn() });
-    const { ctx } = makeCtx(mega);
+    const { ctx, persistentData } = makeCtx(mega);
+    persistentData.megaApi = { ab: "fr" };
     await expect(loginMega(ctx)).resolves.toBe("ok");
     expect(mega.login).not.toHaveBeenCalled();
+    expect(rootMainLogger.info).toHaveBeenCalledWith("v6 login: session state", {
+      persistedSession: true,
+      validSession: true,
+      rtcCredentialsPresent: false,
+      configuredCountry: "FR",
+      persistedRegion: "FR",
+    });
   });
 
   it("returns tfa_required and sends the verify code on 26052", async () => {

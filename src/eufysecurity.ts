@@ -1704,7 +1704,16 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
     });
     try {
       const mega = await this.getMegaApi();
-      if (mega.hasValidSession() && !verifyCode && !captcha) {
+      const savedMegaSession = this.persistentData.megaApi;
+      const validMegaSession = mega.hasValidSession();
+      rootMainLogger.info("v6 login: session state", {
+        persistedSession: savedMegaSession !== undefined,
+        validSession: validMegaSession,
+        rtcCredentialsPresent: this.api.getMegaRtcCredentials() !== null,
+        configuredCountry: (this.config.country ?? "US").toUpperCase(),
+        persistedRegion: savedMegaSession?.ab?.toUpperCase(),
+      });
+      if (validMegaSession && !verifyCode && !captcha) {
         rootMainLogger.info("v6 login: valid persisted session restored");
         try {
           await this.syncMegaPushRegistration();
