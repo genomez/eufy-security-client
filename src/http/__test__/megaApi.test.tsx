@@ -1,4 +1,4 @@
-import { MegaHTTPApi, megaLoginHash, type MegaSession } from "../megaApi";
+import { MegaHTTPApi, megaLoginHash, type MegaApiOptions, type MegaSession } from "../megaApi";
 import { megaEncryptBody, sharedKeyToAesKey, type MegaIdentity } from "../megaCrypto";
 
 jest.mock("../../logging", () => ({
@@ -10,17 +10,34 @@ jest.mock("../../logging", () => ({
  * queued responses, and p-throttle is a pass-through. Returns the api + the list of
  * captured requests so tests can assert on headers/body.
  */
-async function makeApi(responseQueue: Array<{ statusCode: number; body: string }>) {
-  const requests: Array<{ url: string; headers: Record<string, string>; body?: string; json?: unknown }> = [];
+async function makeApi(
+  responseQueue: Array<{ statusCode: number; body: string }>,
+  apiOptions: Partial<MegaApiOptions> = {}
+) {
+  const requests: Array<{
+    url: string;
+    headers: Record<string, string>;
+    body?: string;
+    json?: unknown;
+    retry?: { limit?: number };
+    timeout?: { request?: number };
+  }> = [];
   const gotStub = jest.fn(async (url: string, opts: any) => {
-    requests.push({ url, headers: opts.headers ?? {}, body: opts.body, json: opts.json });
+    requests.push({
+      url,
+      headers: opts.headers ?? {},
+      body: opts.body,
+      json: opts.json,
+      retry: opts.retry,
+      timeout: opts.timeout,
+    });
     const resp = responseQueue.shift() ?? { statusCode: 200, body: "{}" };
     // estimate_domain uses responseType "json" → got returns parsed body.
     if (opts.responseType === "json") return { statusCode: resp.statusCode, body: JSON.parse(resp.body) };
     return { statusCode: resp.statusCode, body: resp.body };
   });
 
-  const api = new MegaHTTPApi({ ab: "fr", osType: "android", minRequestIntervalMs: 0 });
+  const api = new MegaHTTPApi({ ab: "fr", osType: "android", minRequestIntervalMs: 0, ...apiOptions });
   // Bypass init()'s dynamic imports.
   (api as any).got = gotStub;
   (api as any).throttle = <A extends unknown[], R>(fn: (...a: A) => Promise<R>) => fn;
@@ -172,6 +189,28 @@ describe("MegaHTTPApi", () => {
       expect(domains.eufy_security).toBe("security-app-eu.eufylife.com");
       expect(requests[0].url).toContain("/passport/estimate_domain");
       expect(requests[0].json).toEqual({ ab: "fr", mode: 1 });
+      expect(requests[0].retry).toEqual({ limit: 0 });
+      expect(requests[0].timeout).toEqual({ request: 30000 });
+    });
+
+    it("uses the configured request timeout without enabling retries", async () => {
+      const { api, requests } = await makeApi(
+        [
+          {
+            statusCode: 200,
+            body: JSON.stringify({
+              code: 0,
+              msg: "success!",
+              data: { domain: "mega-eu-pr.eufy.com", product_domains: {} },
+            }),
+          },
+        ],
+        { requestTimeoutMs: 1234 }
+      );
+
+      await api.estimateDomain();
+      expect(requests[0].timeout).toEqual({ request: 1234 });
+      expect(requests[0].retry).toEqual({ limit: 0 });
     });
   });
 
@@ -215,6 +254,8 @@ describe("MegaHTTPApi", () => {
       expect(req.headers.gtoken).toMatch(/^[0-9a-f]{32}$/);
       expect(req.headers["x-auth-token"]).toBe("authtok");
       expect(req.headers.authorization).toBe("authtok");
+      expect(req.retry).toEqual({ limit: 0 });
+      expect(req.timeout).toEqual({ request: 30000 });
     });
   });
 

@@ -62,6 +62,8 @@ export interface MegaApiOptions {
   openudid?: string;
   /** Min delay between requests in ms (WAF-friendly). Default 3000. */
   minRequestIntervalMs?: number;
+  /** Maximum duration of one network request in ms. Default 30000. */
+  requestTimeoutMs?: number;
 }
 
 /**

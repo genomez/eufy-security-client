@@ -75,6 +75,7 @@ export class MegaHTTPApi {
   private readonly osVersion: string;
   private readonly phoneModel: string;
   private readonly minIntervalMs: number;
+  private readonly requestTimeoutMs: number;
 
   private got!: any;
   private throttle!: <A extends unknown[], R>(fn: (...a: A) => Promise<R>) => (...a: A) => Promise<R>;
@@ -101,6 +102,7 @@ export class MegaHTTPApi {
     this.phoneModel = opts.phoneModel ?? (this.osType === "android" ? "Pixel 8" : "iPhone 17 Pro");
     if (opts.openudid) this.openudid = opts.openudid;
     this.minIntervalMs = opts.minRequestIntervalMs ?? 3000;
+    this.requestTimeoutMs = Math.max(1000, Math.floor(opts.requestTimeoutMs ?? 30000));
   }
 
   public async init(): Promise<void> {
@@ -207,6 +209,7 @@ export class MegaHTTPApi {
         responseType: "text",
         throwHttpErrors: false,
         retry: { limit: 0 },
+        timeout: { request: this.requestTimeoutMs },
       });
     });
     const resp = await send();
@@ -251,6 +254,8 @@ export class MegaHTTPApi {
         json: { ab: this.ab, mode: 1 },
         responseType: "json",
         throwHttpErrors: false,
+        retry: { limit: 0 },
+        timeout: { request: this.requestTimeoutMs },
       })
     );
     const resp = await send();

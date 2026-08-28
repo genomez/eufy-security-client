@@ -1697,9 +1697,15 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
     verifyCode?: string,
     captcha?: { captchaId: string; answer: string }
   ): Promise<"ok" | "tfa_required" | "captcha_required" | "locked" | "failed"> {
+    let stage = "initialize";
+    rootMainLogger.info("v6 login: bootstrap started", {
+      verificationContinuation: verifyCode !== undefined,
+      captchaContinuation: captcha !== undefined,
+    });
     try {
       const mega = await this.getMegaApi();
       if (mega.hasValidSession() && !verifyCode && !captcha) {
+        rootMainLogger.info("v6 login: valid persisted session restored");
         try {
           await this.syncMegaPushRegistration();
         } catch {
@@ -1708,11 +1714,19 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
         return "ok";
       }
 
+      stage = "estimate_domain";
+      rootMainLogger.info("v6 login: stage estimate_domain");
       await mega.estimateDomain();
+      stage = "key_exchange";
+      rootMainLogger.info("v6 login: stage key_exchange");
       await mega.keyExchange(mega.clusterHost("openapi"));
+      stage = "passport_login";
+      rootMainLogger.info("v6 login: stage passport_login");
       const result = await mega.login(this.config.username!, this.config.password!, verifyCode, captcha);
 
       if (result.code === ResponseErrorCode.CODE_NEED_VERIFY_CODE) {
+        stage = "send_verify_code";
+        rootMainLogger.info("v6 login: stage send_verify_code");
         await mega.sendVerifyCode();
         rootMainLogger.info("v6 login: email 2FA required — call loginMega(code) with the received code");
         return "tfa_required";
@@ -1721,6 +1735,8 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
         result.code === ResponseErrorCode.LOGIN_NEED_CAPTCHA ||
         result.code === ResponseErrorCode.LOGIN_CAPTCHA_ERROR
       ) {
+        stage = "generate_captcha";
+        rootMainLogger.info("v6 login: stage generate_captcha");
         const c = await mega.generateCaptcha();
         this.emit("captcha request", c.captcha_id, c.item);
         rootMainLogger.info("v6 login: captcha required — call loginMega(undefined, {captchaId, answer})");
@@ -1754,7 +1770,12 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
       }
       return "ok";
     } catch (err) {
-      rootMainLogger.error("v6 login error", { error: getError(ensureError(err)) });
+      const error = ensureError(err) as Error & { code?: unknown };
+      rootMainLogger.error("v6 login: bootstrap error", {
+        stage,
+        errorName: error.name,
+        errorCode: typeof error.code === "string" ? error.code : undefined,
+      });
       return "failed";
     }
   }

@@ -7,6 +7,7 @@ jest.mock("../../logging", () => {
 });
 
 import { EufySecurity } from "../../eufysecurity";
+import { rootMainLogger } from "../../logging";
 
 /**
  * Exercises the REAL EufySecurity.loginMega state machine (the one complex orchestration in the v6
@@ -116,6 +117,45 @@ describe("EufySecurity.loginMega", () => {
   it("returns failed (never throws) when getMegaApi throws", async () => {
     const { ctx } = makeCtx({}, { getMegaThrows: true });
     await expect(loginMega(ctx)).resolves.toBe("failed");
+  });
+
+  it("reports the bootstrap stage and does not continue after a timeout", async () => {
+    const keyExchange = jest.fn();
+    const login = jest.fn();
+    const timeout = Object.assign(new Error("request timed out"), { name: "TimeoutError", code: "ETIMEDOUT" });
+    const mega = baseMega({
+      estimateDomain: jest.fn().mockRejectedValue(timeout),
+      keyExchange,
+      login,
+    });
+    const { ctx } = makeCtx(mega);
+
+    await expect(loginMega(ctx)).resolves.toBe("failed");
+    expect(keyExchange).not.toHaveBeenCalled();
+    expect(login).not.toHaveBeenCalled();
+    expect(rootMainLogger.info).toHaveBeenCalledWith("v6 login: stage estimate_domain");
+    expect(rootMainLogger.error).toHaveBeenCalledWith("v6 login: bootstrap error", {
+      stage: "estimate_domain",
+      errorName: "TimeoutError",
+      errorCode: "ETIMEDOUT",
+    });
+  });
+
+  it("logs each bootstrap stage before a successful login", async () => {
+    const mega = baseMega({
+      login: jest.fn().mockResolvedValue({ code: 0 }),
+      exportSession: jest.fn().mockReturnValue({ ab: "fr", openudid: "x", cloud_token: "t" }),
+    });
+    const { ctx } = makeCtx(mega);
+
+    await expect(loginMega(ctx)).resolves.toBe("ok");
+    expect(rootMainLogger.info).toHaveBeenCalledWith("v6 login: bootstrap started", {
+      verificationContinuation: false,
+      captchaContinuation: false,
+    });
+    expect(rootMainLogger.info).toHaveBeenCalledWith("v6 login: stage estimate_domain");
+    expect(rootMainLogger.info).toHaveBeenCalledWith("v6 login: stage key_exchange");
+    expect(rootMainLogger.info).toHaveBeenCalledWith("v6 login: stage passport_login");
   });
 
   it("persists the session and returns ok on success", async () => {
