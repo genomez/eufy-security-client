@@ -13,6 +13,57 @@ export interface StationRtcTransportEvents {
   handoff: (info: { durationMs: number }) => void;
 }
 
+type RtcConnectWaitSession = Pick<RtcSession, "connect" | "on" | "off">;
+
+/**
+ * Arm the session events and the timeout as one immediately observed promise.
+ * This prevents a failed/slow connect() from leaving a separate timeout promise
+ * behind to reject later as an unhandled rejection.
+ */
+export function connectAndWaitForRtcSession(session: RtcConnectWaitSession, timeoutMs: number): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+
+    const cleanup = (): void => {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+      session.off("connected", onConnected);
+      session.off("error", onError);
+      session.off("close", onClose);
+    };
+    const finish = (error?: Error): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+    const onConnected = (): void => finish();
+    const onError = (error: unknown): void => finish(error instanceof Error ? error : new Error(String(error)));
+    const onClose = (): void => finish(new Error("T9000 RTC handoff closed before connect"));
+
+    session.on("connected", onConnected);
+    session.on("error", onError);
+    session.on("close", onClose);
+    timer = setTimeout(() => finish(new Error("T9000 RTC handoff timeout")), timeoutMs);
+
+    try {
+      void session
+        .connect()
+        .catch((error: unknown) => finish(error instanceof Error ? error : new Error(String(error))));
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
+}
+
 /**
  * T9000 WebRTC transport — sign → WS auth → scall → data channel.
  * Replaces legacy TUTK P2P for HomeBase Professional S1.
@@ -34,10 +85,7 @@ export class StationRtcTransport extends EventEmitter {
     // completes in <1s; when it fails, DTLS gives up at ~31s. The old 180s default meant a failed
     // attempt blocked reconnect for 3 minutes. Cap at 45s (past the DTLS timeout) so a missed
     // handshake retries promptly. Tunable via RTC_CONNECT_TIMEOUT_MS.
-    private readonly connectTimeoutMs = Math.max(
-      10000,
-      Number(process.env.RTC_CONNECT_TIMEOUT_MS ?? "45000") || 45000
-    )
+    private readonly connectTimeoutMs = Math.max(10000, Number(process.env.RTC_CONNECT_TIMEOUT_MS ?? "45000") || 45000)
   ) {
     super();
   }
@@ -145,44 +193,12 @@ export class StationRtcTransport extends EventEmitter {
       stationSn: this.stationSn,
     });
 
-    let settled = false;
-    const waitConnected = new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          reject(new Error("T9000 RTC handoff timeout"));
-        }
-      }, this.connectTimeoutMs);
-
-      newSession.on("connected", () => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          resolve();
-        }
-      });
-      newSession.on("error", (err) => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          reject(err instanceof Error ? err : new Error(String(err)));
-        }
-      });
-      newSession.on("close", () => {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          reject(new Error("T9000 RTC handoff closed before connect"));
-        }
-      });
-      newSession.on("commandData", (data, linkType) => {
-        this.commandDataHandler?.(data, linkType);
-      });
+    newSession.on("commandData", (data, linkType) => {
+      this.commandDataHandler?.(data, linkType);
     });
 
     try {
-      await newSession.connect();
-      await waitConnected;
+      await connectAndWaitForRtcSession(newSession, this.connectTimeoutMs);
 
       // Swap before retiring old so sendCommand uses the new channel immediately.
       this.session = newSession;
