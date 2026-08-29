@@ -1,5 +1,6 @@
 import { MegaHTTPApi, megaLoginHash, type MegaApiOptions, type MegaSession } from "../megaApi";
 import { megaEncryptBody, sharedKeyToAesKey, type MegaIdentity } from "../megaCrypto";
+import { rootHTTPLogger } from "../../logging";
 
 jest.mock("../../logging", () => ({
   rootHTTPLogger: { error: jest.fn(), debug: jest.fn(), info: jest.fn(), warn: jest.fn() },
@@ -170,6 +171,61 @@ describe("MegaHTTPApi", () => {
       await (api as any).signedPost("app-things-eu-pr.eufy.com", "/app/things/x", {}, fakeIdentity());
 
       expect((api as any).identities.size).toBe(1);
+    });
+  });
+
+  describe("request lifecycle diagnostics", () => {
+    it("bounds throttle queue wait and reports that the HTTP request never started", async () => {
+      const { api, gotStub } = await makeApi([], { requestLifecycleTimeoutMs: 20 });
+      const neverStarts = Object.assign(() => new Promise<never>(() => undefined), { queueSize: 3 });
+      (api as any).throttle = () => neverStarts;
+
+      await expect(
+        (api as any).signedPost("app-openapi-eu-pr.eufy.com", "/openapi/oauth/key/exchange", {}, fakeIdentity())
+      ).rejects.toMatchObject({
+        name: "MegaRequestLifecycleTimeoutError",
+        code: "MEGA_REQUEST_LIFECYCLE_TIMEOUT",
+      });
+
+      expect(gotStub).not.toHaveBeenCalled();
+      expect(rootHTTPLogger.info).toHaveBeenCalledWith("MegaApi lifecycle queued", {
+        host: "app-openapi-eu-pr.eufy.com",
+        path: "/openapi/oauth/key/exchange",
+        queueDepthBefore: 3,
+        lifecycleTimeoutMs: 1000,
+      });
+      expect(rootHTTPLogger.warn).toHaveBeenCalledWith(
+        "MegaApi lifecycle settled",
+        expect.objectContaining({
+          outcome: "error",
+          phase: "queue",
+          errorName: "MegaRequestLifecycleTimeoutError",
+          errorCode: "MEGA_REQUEST_LIFECYCLE_TIMEOUT",
+        })
+      );
+    });
+
+    it("reports when HTTP execution starts and settles", async () => {
+      const { api } = await makeApi([{ statusCode: 200, body: JSON.stringify({ code: 0, msg: "ok" }) }]);
+
+      await (api as any).signedPost("app-openapi-eu-pr.eufy.com", "/openapi/oauth/key/exchange", {}, fakeIdentity());
+
+      expect(rootHTTPLogger.info).toHaveBeenCalledWith(
+        "MegaApi lifecycle HTTP started",
+        expect.objectContaining({
+          host: "app-openapi-eu-pr.eufy.com",
+          path: "/openapi/oauth/key/exchange",
+          requestTimeoutMs: 30000,
+        })
+      );
+      expect(rootHTTPLogger.info).toHaveBeenCalledWith(
+        "MegaApi lifecycle settled",
+        expect.objectContaining({
+          outcome: "response",
+          phase: "http",
+          status: 200,
+        })
+      );
     });
   });
 

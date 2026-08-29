@@ -64,6 +64,8 @@ export interface MegaApiOptions {
   minRequestIntervalMs?: number;
   /** Maximum duration of one network request in ms. Default 30000. */
   requestTimeoutMs?: number;
+  /** Maximum duration including throttle queue wait and network execution. Default request timeout + 15000. */
+  requestLifecycleTimeoutMs?: number;
 }
 
 /**

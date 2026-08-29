@@ -67,6 +67,15 @@ const LOGIN_SERVER_PUBLIC_KEY =
 export const megaLoginHash = (email: string, password: string, openudid: string): string =>
   createHash("sha256").update(`${openudid}:${email}:${password}`).digest("hex");
 
+class MegaRequestLifecycleTimeoutError extends Error {
+  public readonly code = "MEGA_REQUEST_LIFECYCLE_TIMEOUT";
+
+  constructor() {
+    super("Mega request exceeded its queue and network lifecycle timeout");
+    this.name = "MegaRequestLifecycleTimeoutError";
+  }
+}
+
 export class MegaHTTPApi {
   private readonly ab: string;
   private readonly osType: string;
@@ -76,6 +85,7 @@ export class MegaHTTPApi {
   private readonly phoneModel: string;
   private readonly minIntervalMs: number;
   private readonly requestTimeoutMs: number;
+  private readonly requestLifecycleTimeoutMs: number;
 
   private got!: any;
   private throttle!: <A extends unknown[], R>(fn: (...a: A) => Promise<R>) => (...a: A) => Promise<R>;
@@ -103,6 +113,10 @@ export class MegaHTTPApi {
     if (opts.openudid) this.openudid = opts.openudid;
     this.minIntervalMs = opts.minRequestIntervalMs ?? 3000;
     this.requestTimeoutMs = Math.max(1000, Math.floor(opts.requestTimeoutMs ?? 30000));
+    this.requestLifecycleTimeoutMs = Math.max(
+      1000,
+      Math.floor(opts.requestLifecycleTimeoutMs ?? this.requestTimeoutMs + 15000)
+    );
   }
 
   public async init(): Promise<void> {
@@ -199,9 +213,17 @@ export class MegaHTTPApi {
       headers.authorization = this.authToken;
     }
 
-    rootHTTPLogger.debug("MegaApi request", { host, path, osType: this.osType, keyIdent });
-
+    const lifecycleStartedAt = Date.now();
+    let httpStartedAt: number | undefined;
+    const abortController = new AbortController();
     const send = this.throttle(async () => {
+      httpStartedAt = Date.now();
+      rootHTTPLogger.info("MegaApi lifecycle HTTP started", {
+        host,
+        path,
+        queueWaitMs: httpStartedAt - lifecycleStartedAt,
+        requestTimeoutMs: this.requestTimeoutMs,
+      });
       return await this.got(`https://${host}${path}`, {
         method: "POST",
         headers,
@@ -210,9 +232,53 @@ export class MegaHTTPApi {
         throwHttpErrors: false,
         retry: { limit: 0 },
         timeout: { request: this.requestTimeoutMs },
+        signal: abortController.signal,
       });
+    }) as (() => Promise<any>) & { readonly queueSize?: number };
+
+    rootHTTPLogger.info("MegaApi lifecycle queued", {
+      host,
+      path,
+      queueDepthBefore: send.queueSize ?? 0,
+      lifecycleTimeoutMs: this.requestLifecycleTimeoutMs,
     });
-    const resp = await send();
+
+    let lifecycleTimeout: ReturnType<typeof setTimeout> | undefined;
+    let resp: any;
+    try {
+      const requestPromise = send();
+      resp = await new Promise<any>((resolve, reject) => {
+        requestPromise.then(resolve, reject);
+        lifecycleTimeout = setTimeout(() => {
+          reject(new MegaRequestLifecycleTimeoutError());
+          abortController.abort();
+        }, this.requestLifecycleTimeoutMs);
+      });
+      rootHTTPLogger.info("MegaApi lifecycle settled", {
+        host,
+        path,
+        outcome: "response",
+        phase: "http",
+        elapsedMs: Date.now() - lifecycleStartedAt,
+        status: resp.statusCode,
+      });
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error("Unknown Mega request error");
+      const code = (error as Error & { code?: unknown }).code;
+      rootHTTPLogger.warn("MegaApi lifecycle settled", {
+        host,
+        path,
+        outcome: "error",
+        phase: httpStartedAt === undefined ? "queue" : "http",
+        elapsedMs: Date.now() - lifecycleStartedAt,
+        errorName: error.name,
+        errorCode: typeof code === "string" ? code : undefined,
+      });
+      throw error;
+    } finally {
+      if (lifecycleTimeout !== undefined) clearTimeout(lifecycleTimeout);
+    }
+
     const responseText: string = resp.body ?? "";
     let parsed: MegaResult;
     try {
