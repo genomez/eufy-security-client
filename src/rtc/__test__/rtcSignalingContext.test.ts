@@ -4,7 +4,7 @@ jest.mock("../../logging", () => {
 });
 
 import { rootHTTPLogger } from "../../logging";
-import { RtcSignalingClient } from "../rtcSignaling";
+import { defaultSignalingRegionForCountry, RtcSignalingClient } from "../rtcSignaling";
 
 describe("RtcSignalingClient fetchSign diagnostics", () => {
   afterEach(() => {
@@ -73,5 +73,12 @@ describe("RtcSignalingClient fetchSign diagnostics", () => {
     });
 
     expect(client.getWsUrl()).toBe("wss://signaling.test.invalid/v1/rtc/ws/join?reqtype=nvr");
+  });
+
+  it("uses the EU cluster in the FR WebSocket auth payload", () => {
+    expect(defaultSignalingRegionForCountry("FR")).toBe("EU");
+    expect(defaultSignalingRegionForCountry(" fr ")).toBe("EU");
+    expect(defaultSignalingRegionForCountry("US")).toBe("US");
+    expect(defaultSignalingRegionForCountry()).toBe("US");
   });
 });
