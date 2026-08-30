@@ -28,7 +28,7 @@ describe("RtcSignalingClient fetchSign diagnostics", () => {
     await expect(client.fetchSign()).resolves.toBe("sign-value");
 
     expect(rootHTTPLogger.info).toHaveBeenCalledWith("RtcSignaling fetchSign context", {
-      host: "security-smart.eufylife.com",
+      host: "security-smart-eu.eufylife.com",
       region: "FR",
       authTokenPresent: true,
       gtokenPresent: true,
@@ -36,8 +36,31 @@ describe("RtcSignalingClient fetchSign diagnostics", () => {
     expect(JSON.stringify((rootHTTPLogger.info as jest.Mock).mock.calls)).not.toContain("secret-auth-token");
     expect(JSON.stringify((rootHTTPLogger.info as jest.Mock).mock.calls)).not.toContain("secret-gtoken");
     expect(fetchMock).toHaveBeenCalledWith(
-      "https://security-smart.eufylife.com/v1/smart/nvr/ws/sign",
+      "https://security-smart-eu.eufylife.com/v1/smart/nvr/ws/sign",
       expect.objectContaining({ headers: expect.objectContaining({ Country: "FR" }) })
     );
+  });
+
+  it("retains the current default host outside the isolated FR test", () => {
+    const client = new RtcSignalingClient({
+      authToken: "secret-auth-token",
+      gtoken: "secret-gtoken",
+      stationSn: "station",
+      region: "US",
+    });
+
+    expect(client.getWsUrl()).toBe("wss://security-smart.eufylife.com/v1/rtc/ws/join?reqtype=nvr");
+  });
+
+  it("preserves an explicit signaling-host override", () => {
+    const client = new RtcSignalingClient({
+      authToken: "secret-auth-token",
+      gtoken: "secret-gtoken",
+      stationSn: "station",
+      region: "FR",
+      smartHost: "signaling.test.invalid",
+    });
+
+    expect(client.getWsUrl()).toBe("wss://signaling.test.invalid/v1/rtc/ws/join?reqtype=nvr");
   });
 });
