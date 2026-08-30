@@ -30,15 +30,26 @@ describe("RtcSignalingClient fetchSign diagnostics", () => {
     expect(rootHTTPLogger.info).toHaveBeenCalledWith("RtcSignaling fetchSign context", {
       host: "security-smart-eu.eufylife.com",
       region: "FR",
+      requestProfile: "web-portal",
       authTokenPresent: true,
       gtokenPresent: true,
     });
     expect(JSON.stringify((rootHTTPLogger.info as jest.Mock).mock.calls)).not.toContain("secret-auth-token");
     expect(JSON.stringify((rootHTTPLogger.info as jest.Mock).mock.calls)).not.toContain("secret-gtoken");
-    expect(fetchMock).toHaveBeenCalledWith(
-      "https://security-smart-eu.eufylife.com/v1/smart/nvr/ws/sign",
-      expect.objectContaining({ headers: expect.objectContaining({ Country: "FR" }) })
-    );
+    expect(fetchMock).toHaveBeenCalledWith("https://security-smart-eu.eufylife.com/v1/smart/nvr/ws/sign", {
+      headers: {
+        "Web-Country": "FR",
+        "X-Auth-Token": "secret-auth-token",
+        "App-Name": "eufy_mega",
+        "Model-Type": "WEB",
+        GToken: "secret-gtoken",
+        Origin: "https://security.eufy.com",
+      },
+    });
+    const headers = fetchMock.mock.calls[0][1]?.headers as Record<string, string>;
+    expect(headers).not.toHaveProperty("Country");
+    expect(headers).not.toHaveProperty("Language");
+    expect(headers).not.toHaveProperty("X-Auth-User");
   });
 
   it("retains the current default host outside the isolated FR test", () => {
