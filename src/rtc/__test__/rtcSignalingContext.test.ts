@@ -3,16 +3,15 @@ jest.mock("../../logging", () => {
   return new Proxy({}, { get: () => stub });
 });
 
-import { rootHTTPLogger } from "../../logging";
 import { RtcSignalingClient } from "../rtcSignaling";
 
-describe("RtcSignalingClient fetchSign diagnostics", () => {
+describe("RtcSignalingClient regional signaling context", () => {
   afterEach(() => {
     jest.restoreAllMocks();
     jest.clearAllMocks();
   });
 
-  it("logs only redacted endpoint context before requesting a sign", async () => {
+  it("uses the EU host and web portal headers for FR", async () => {
     const fetchMock = jest.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: true,
       status: 200,
@@ -27,18 +26,20 @@ describe("RtcSignalingClient fetchSign diagnostics", () => {
 
     await expect(client.fetchSign()).resolves.toBe("sign-value");
 
-    expect(rootHTTPLogger.info).toHaveBeenCalledWith("RtcSignaling fetchSign context", {
-      host: "security-smart-eu.eufylife.com",
-      region: "FR",
-      authTokenPresent: true,
-      gtokenPresent: true,
+    expect(fetchMock).toHaveBeenCalledWith("https://security-smart-eu.eufylife.com/v1/smart/nvr/ws/sign", {
+      headers: {
+        "Web-Country": "FR",
+        "X-Auth-Token": "secret-auth-token",
+        "App-Name": "eufy_mega",
+        "Model-Type": "WEB",
+        GToken: "secret-gtoken",
+        Origin: "https://security.eufy.com",
+      },
     });
-    expect(JSON.stringify((rootHTTPLogger.info as jest.Mock).mock.calls)).not.toContain("secret-auth-token");
-    expect(JSON.stringify((rootHTTPLogger.info as jest.Mock).mock.calls)).not.toContain("secret-gtoken");
-    expect(fetchMock).toHaveBeenCalledWith(
-      "https://security-smart-eu.eufylife.com/v1/smart/nvr/ws/sign",
-      expect.objectContaining({ headers: expect.objectContaining({ Country: "FR" }) })
-    );
+    const headers = fetchMock.mock.calls[0][1]?.headers as Record<string, string>;
+    expect(headers).not.toHaveProperty("Country");
+    expect(headers).not.toHaveProperty("Language");
+    expect(headers).not.toHaveProperty("X-Auth-User");
   });
 
   it("retains the current default host outside the isolated FR test", () => {

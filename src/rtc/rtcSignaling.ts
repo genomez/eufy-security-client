@@ -69,12 +69,12 @@ export class RtcSignalingClient extends EventEmitter {
     const url = `https://${host}/v1/smart/nvr/ws/sign`;
     const res = await fetch(url, {
       headers: {
+        "Web-Country": this.opts.region,
         "X-Auth-Token": this.opts.authToken,
-        GToken: this.opts.gtoken,
         "App-Name": "eufy_mega",
         "Model-Type": "WEB",
-        Country: this.opts.region,
-        Language: "en",
+        GToken: this.opts.gtoken,
+        Origin: "https://security.eufy.com",
       },
     });
     const body = (await res.json()) as { code?: number; data?: string; msg?: string };
