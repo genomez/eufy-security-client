@@ -426,7 +426,12 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
     this.api.setMegaCloudWakeHandler(async () => {
       try {
         const mega = await this.getMegaApi();
-        if (!mega.hasValidSession()) {
+        const validSession = mega.hasValidSession();
+        rootMainLogger.info("v6 cloud wake: session gate", {
+          megaInstanceId: mega.getDiagnosticInstanceId(),
+          validSession,
+        });
+        if (!validSession) {
           rootMainLogger.debug("v6 cloud wake: no valid mega session, skipping");
           return;
         }
@@ -1707,6 +1712,7 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
       const savedMegaSession = this.persistentData.megaApi;
       const validMegaSession = mega.hasValidSession();
       rootMainLogger.info("v6 login: session state", {
+        megaInstanceId: mega.getDiagnosticInstanceId(),
         persistedSession: savedMegaSession !== undefined,
         validSession: validMegaSession,
         rtcCredentialsPresent: this.api.getMegaRtcCredentials() !== null,

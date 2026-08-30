@@ -77,6 +77,8 @@ class MegaRequestLifecycleTimeoutError extends Error {
 }
 
 export class MegaHTTPApi {
+  private static nextDiagnosticInstanceId = 1;
+
   private readonly ab: string;
   private readonly osType: string;
   private readonly appName: string;
@@ -86,6 +88,10 @@ export class MegaHTTPApi {
   private readonly minIntervalMs: number;
   private readonly requestTimeoutMs: number;
   private readonly requestLifecycleTimeoutMs: number;
+  private readonly diagnosticInstanceId = MegaHTTPApi.nextDiagnosticInstanceId++;
+  private nextLifecycleRequestId = 1;
+  private nextKeyExchangeId = 1;
+  private readonly activeKeyExchanges = new Map<string, number>();
 
   private got!: any;
   private throttle!: <A extends unknown[], R>(fn: (...a: A) => Promise<R>) => (...a: A) => Promise<R>;
@@ -124,6 +130,15 @@ export class MegaHTTPApi {
     const { default: got } = await import("got");
     this.got = got;
     this.throttle = pThrottle({ limit: 1, interval: this.minIntervalMs });
+    rootHTTPLogger.info("MegaApi diagnostic instance initialized", {
+      instanceId: this.diagnosticInstanceId,
+      minIntervalMs: this.minIntervalMs,
+    });
+  }
+
+  /** Process-local diagnostic identifier; contains no account, device, or authentication data. */
+  public getDiagnosticInstanceId(): number {
+    return this.diagnosticInstanceId;
   }
 
   private get gtoken(): string | undefined {
@@ -156,6 +171,7 @@ export class MegaHTTPApi {
     identity?: MegaIdentity,
     bootstrap?: { keyIdent: string; encryptedValue: string }
   ): Promise<MegaResult> {
+    const requestId = this.nextLifecycleRequestId++;
     const ts = `${Math.floor(Date.now() / 1000)}`;
     const nonce = generateKeyIdent();
 
@@ -219,6 +235,8 @@ export class MegaHTTPApi {
     const send = this.throttle(async () => {
       httpStartedAt = Date.now();
       rootHTTPLogger.info("MegaApi lifecycle HTTP started", {
+        instanceId: this.diagnosticInstanceId,
+        requestId,
         host,
         path,
         queueWaitMs: httpStartedAt - lifecycleStartedAt,
@@ -237,6 +255,8 @@ export class MegaHTTPApi {
     }) as (() => Promise<any>) & { readonly queueSize?: number };
 
     rootHTTPLogger.info("MegaApi lifecycle queued", {
+      instanceId: this.diagnosticInstanceId,
+      requestId,
       host,
       path,
       queueDepthBefore: send.queueSize ?? 0,
@@ -246,15 +266,32 @@ export class MegaHTTPApi {
     let lifecycleTimeout: ReturnType<typeof setTimeout> | undefined;
     let resp: any;
     try {
-      const requestPromise = send();
-      resp = await new Promise<any>((resolve, reject) => {
-        requestPromise.then(resolve, reject);
+      const lifecyclePromise = new Promise<never>((_resolve, reject) => {
         lifecycleTimeout = setTimeout(() => {
           reject(new MegaRequestLifecycleTimeoutError());
           abortController.abort();
         }, this.requestLifecycleTimeoutMs);
       });
+      rootHTTPLogger.info("MegaApi lifecycle watchdog armed", {
+        instanceId: this.diagnosticInstanceId,
+        requestId,
+        host,
+        path,
+        lifecycleTimeoutMs: this.requestLifecycleTimeoutMs,
+      });
+
+      const requestPromise = send();
+      rootHTTPLogger.info("MegaApi lifecycle dispatched", {
+        instanceId: this.diagnosticInstanceId,
+        requestId,
+        host,
+        path,
+        queueDepthAfter: send.queueSize ?? 0,
+      });
+      resp = await Promise.race([requestPromise, lifecyclePromise]);
       rootHTTPLogger.info("MegaApi lifecycle settled", {
+        instanceId: this.diagnosticInstanceId,
+        requestId,
         host,
         path,
         outcome: "response",
@@ -266,6 +303,8 @@ export class MegaHTTPApi {
       const error = err instanceof Error ? err : new Error("Unknown Mega request error");
       const code = (error as Error & { code?: unknown }).code;
       rootHTTPLogger.warn("MegaApi lifecycle settled", {
+        instanceId: this.diagnosticInstanceId,
+        requestId,
         host,
         path,
         outcome: "error",
@@ -340,21 +379,58 @@ export class MegaHTTPApi {
    */
   public async keyExchange(openapiHost: string): Promise<MegaIdentity> {
     const cached = this.identities.get(openapiHost);
-    if (cached) return cached;
+    if (cached) {
+      rootHTTPLogger.info("MegaApi key/exchange cache", {
+        instanceId: this.diagnosticInstanceId,
+        openapiHost,
+        cacheState: "hit",
+        activeForHost: this.activeKeyExchanges.get(openapiHost) ?? 0,
+      });
+      return cached;
+    }
+
+    const exchangeId = this.nextKeyExchangeId++;
+    const activeBefore = this.activeKeyExchanges.get(openapiHost) ?? 0;
+    this.activeKeyExchanges.set(openapiHost, activeBefore + 1);
+    rootHTTPLogger.info("MegaApi key/exchange begin", {
+      instanceId: this.diagnosticInstanceId,
+      exchangeId,
+      openapiHost,
+      cacheState: "miss",
+      activeForHostBefore: activeBefore,
+    });
 
     const { ecdh, clientPublicKeyBody, clientPublicKey, keyIdent } = buildKeyExchange();
+    let outcome = "error";
+    try {
+      const result = await this.signedPost(openapiHost, "/openapi/oauth/key/exchange", undefined, undefined, {
+        keyIdent,
+        encryptedValue: clientPublicKeyBody,
+      });
+      if (result.code !== 0) throw new Error(`key/exchange failed on ${openapiHost}: ${result.code} ${result.msg}`);
 
-    const result = await this.signedPost(openapiHost, "/openapi/oauth/key/exchange", undefined, undefined, {
-      keyIdent,
-      encryptedValue: clientPublicKeyBody,
-    });
-    if (result.code !== 0) throw new Error(`key/exchange failed on ${openapiHost}: ${result.code} ${result.msg}`);
-
-    const serverPubEnc = (result.data as { server_public_key: string }).server_public_key;
-    const identity = finalizeKeyExchange(ecdh, serverPubEnc, keyIdent, clientPublicKey);
-    this.identities.set(openapiHost, identity);
-    rootHTTPLogger.info("MegaApi key/exchange ok", { openapiHost, keyIdent });
-    return identity;
+      const serverPubEnc = (result.data as { server_public_key: string }).server_public_key;
+      const identity = finalizeKeyExchange(ecdh, serverPubEnc, keyIdent, clientPublicKey);
+      this.identities.set(openapiHost, identity);
+      outcome = "success";
+      rootHTTPLogger.info("MegaApi key/exchange ok", {
+        instanceId: this.diagnosticInstanceId,
+        exchangeId,
+        openapiHost,
+      });
+      return identity;
+    } finally {
+      const activeAfter = Math.max(0, (this.activeKeyExchanges.get(openapiHost) ?? 1) - 1);
+      if (activeAfter === 0) this.activeKeyExchanges.delete(openapiHost);
+      else this.activeKeyExchanges.set(openapiHost, activeAfter);
+      rootHTTPLogger.info("MegaApi key/exchange end", {
+        instanceId: this.diagnosticInstanceId,
+        exchangeId,
+        openapiHost,
+        outcome,
+        activeForHostAfter: activeAfter,
+      });
+    }
   }
 
   /**

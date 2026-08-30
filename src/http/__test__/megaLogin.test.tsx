@@ -18,6 +18,7 @@ type MegaStub = Partial<
   Pick<
     MegaHTTPApi,
     | "hasValidSession"
+    | "getDiagnosticInstanceId"
     | "estimateDomain"
     | "keyExchange"
     | "login"
@@ -58,6 +59,7 @@ function makeCtx(mega: MegaStub, opts?: { getMegaThrows?: boolean }) {
 
 const baseMega = (over: MegaStub): MegaStub => ({
   hasValidSession: () => false,
+  getDiagnosticInstanceId: () => 7,
   estimateDomain: jest.fn().mockResolvedValue({}),
   keyExchange: jest.fn().mockResolvedValue({}),
   clusterHost: () => "app-openapi-eu-pr.eufy.com",
@@ -81,6 +83,7 @@ describe("EufySecurity.loginMega", () => {
     await expect(loginMega(ctx)).resolves.toBe("ok");
     expect(mega.login).not.toHaveBeenCalled();
     expect(rootMainLogger.info).toHaveBeenCalledWith("v6 login: session state", {
+      megaInstanceId: 7,
       persistedSession: true,
       validSession: true,
       rtcCredentialsPresent: false,

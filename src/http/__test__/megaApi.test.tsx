@@ -188,12 +188,35 @@ describe("MegaHTTPApi", () => {
       });
 
       expect(gotStub).not.toHaveBeenCalled();
-      expect(rootHTTPLogger.info).toHaveBeenCalledWith("MegaApi lifecycle queued", {
-        host: "app-openapi-eu-pr.eufy.com",
-        path: "/openapi/oauth/key/exchange",
-        queueDepthBefore: 3,
-        lifecycleTimeoutMs: 1000,
-      });
+      expect(rootHTTPLogger.info).toHaveBeenCalledWith(
+        "MegaApi lifecycle queued",
+        expect.objectContaining({
+          host: "app-openapi-eu-pr.eufy.com",
+          path: "/openapi/oauth/key/exchange",
+          queueDepthBefore: 3,
+          lifecycleTimeoutMs: 1000,
+        })
+      );
+      expect(rootHTTPLogger.info).toHaveBeenCalledWith(
+        "MegaApi lifecycle watchdog armed",
+        expect.objectContaining({
+          host: "app-openapi-eu-pr.eufy.com",
+          path: "/openapi/oauth/key/exchange",
+          lifecycleTimeoutMs: 1000,
+        })
+      );
+      expect(rootHTTPLogger.info).toHaveBeenCalledWith(
+        "MegaApi lifecycle dispatched",
+        expect.objectContaining({
+          host: "app-openapi-eu-pr.eufy.com",
+          path: "/openapi/oauth/key/exchange",
+          queueDepthAfter: 3,
+        })
+      );
+      const lifecycleMessages = (rootHTTPLogger.info as jest.Mock).mock.calls.map(([message]) => message);
+      expect(lifecycleMessages.indexOf("MegaApi lifecycle watchdog armed")).toBeLessThan(
+        lifecycleMessages.indexOf("MegaApi lifecycle dispatched")
+      );
       expect(rootHTTPLogger.warn).toHaveBeenCalledWith(
         "MegaApi lifecycle settled",
         expect.objectContaining({
@@ -226,6 +249,30 @@ describe("MegaHTTPApi", () => {
           status: 200,
         })
       );
+
+      const lifecycleCalls = (rootHTTPLogger.info as jest.Mock).mock.calls
+        .filter(([message]) => typeof message === "string" && message.startsWith("MegaApi lifecycle"))
+        .map(([, details]) => details as { instanceId: number; requestId: number });
+      expect(lifecycleCalls.length).toBeGreaterThanOrEqual(5);
+      expect(new Set(lifecycleCalls.map(({ instanceId }) => instanceId)).size).toBe(1);
+      expect(new Set(lifecycleCalls.map(({ requestId }) => requestId)).size).toBe(1);
+    });
+
+    it("assigns distinct request IDs on one process-local Mega instance", async () => {
+      const { api } = await makeApi([
+        { statusCode: 200, body: JSON.stringify({ code: 0, msg: "ok" }) },
+        { statusCode: 200, body: JSON.stringify({ code: 0, msg: "ok" }) },
+      ]);
+
+      await (api as any).signedPost("app-things-eu-pr.eufy.com", "/app/things/one", {}, fakeIdentity());
+      await (api as any).signedPost("app-things-eu-pr.eufy.com", "/app/things/two", {}, fakeIdentity());
+
+      const queued = (rootHTTPLogger.info as jest.Mock).mock.calls
+        .filter(([message]) => message === "MegaApi lifecycle queued")
+        .map(([, details]) => details as { instanceId: number; requestId: number });
+      expect(queued).toHaveLength(2);
+      expect(queued[0].instanceId).toBe(queued[1].instanceId);
+      expect(queued[0].requestId).not.toBe(queued[1].requestId);
     });
   });
 
