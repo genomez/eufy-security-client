@@ -278,22 +278,12 @@ export class RtcPeerConnection extends EventEmitter {
     // (host-only) unless explicitly re-enabled, so ICE gathering finishes instantly.
     // allowTurn overrides RTC_NO_TURN for short camera-channel live-wake sessions.
     const noTurn =
-      !this.peerOptions.allowTurn &&
-      (process.env.RTC_NO_TURN === "1" || process.env.RTC_NO_TURN === "true");
+      !this.peerOptions.allowTurn && (process.env.RTC_NO_TURN === "1" || process.env.RTC_NO_TURN === "true");
     const iceServers: IceServer[] = [];
     if (!noTurn) {
-      iceServers.push(
-        ...turnIceServers(turn.turn_addr, turn.turn_port, turn.turn_user, turn.turn_password)
-      );
+      iceServers.push(...turnIceServers(turn.turn_addr, turn.turn_port, turn.turn_user, turn.turn_password));
       if (turn.alt_turn_addr && turn.alt_turn_port) {
-        iceServers.push(
-          ...turnIceServers(
-            turn.alt_turn_addr,
-            turn.alt_turn_port,
-            turn.turn_user,
-            turn.turn_password
-          )
-        );
+        iceServers.push(...turnIceServers(turn.alt_turn_addr, turn.alt_turn_port, turn.turn_user, turn.turn_password));
       }
     }
 
@@ -430,8 +420,7 @@ export class RtcPeerConnection extends EventEmitter {
     }
     let answerSdp = sdpAnswer;
     const noTurn =
-      !this.peerOptions.allowTurn &&
-      (process.env.RTC_NO_TURN === "1" || process.env.RTC_NO_TURN === "true");
+      !this.peerOptions.allowTurn && (process.env.RTC_NO_TURN === "1" || process.env.RTC_NO_TURN === "true");
     if ((this.peerOptions.iceTransportPolicy ?? "relay") === "relay") {
       answerSdp = filterSdpRelayCandidates(sdpAnswer);
     } else if (noTurn) {
@@ -682,12 +671,19 @@ export class RtcPeerConnection extends EventEmitter {
       if (name === "WebrtcDataChannel") {
         void this.initSctpFramer(dc)
           .then(() => {
+            if (!this.pc || !dc.isOpen() || !this.sctpFramer?.isReady()) {
+              return;
+            }
             this.commandChannelOpen = true;
             this.stopSnapshotWatchdog();
             this.logSnapshot("commandChannelOpen");
             this.emit("commandChannelOpen");
           })
           .catch((err) => {
+            if (!this.pc || !dc.isOpen()) {
+              rootHTTPLogger.info("RtcPeer SCTP setup cancelled after peer close");
+              return;
+            }
             rootHTTPLogger.error("RtcPeer command channel SCTP setup failed", {
               error: err instanceof Error ? err.message : String(err),
             });
@@ -707,11 +703,7 @@ export class RtcPeerConnection extends EventEmitter {
     });
     dc.onMessage((msg) => {
       const buf =
-        typeof msg === "string"
-          ? Buffer.from(msg)
-          : Buffer.isBuffer(msg)
-            ? msg
-            : Buffer.from(msg as ArrayBuffer);
+        typeof msg === "string" ? Buffer.from(msg) : Buffer.isBuffer(msg) ? msg : Buffer.from(msg as ArrayBuffer);
       if (name === "WebrtcDataChannel" && this.sctpFramer?.isReady()) {
         this.sctpFramer.recvPacket(buf);
         return;
@@ -762,8 +754,11 @@ export class RtcPeerConnection extends EventEmitter {
         }
       )
       .catch((err) => {
-        this.sctpFramer = undefined;
-        this.sctpFramerInit = undefined;
+        if (this.sctpFramer === framer) {
+          framer.destroy();
+          this.sctpFramer = undefined;
+          this.sctpFramerInit = undefined;
+        }
         throw err;
       });
     return this.sctpFramerInit;
@@ -887,8 +882,7 @@ export class RtcPeerConnection extends EventEmitter {
     // and the handshake stalls ~31s then drops. Restricting to host candidates removes that race so
     // ICE deterministically settles on the working direct LAN pair.
     const noTurn =
-      !this.peerOptions.allowTurn &&
-      (process.env.RTC_NO_TURN === "1" || process.env.RTC_NO_TURN === "true");
+      !this.peerOptions.allowTurn && (process.env.RTC_NO_TURN === "1" || process.env.RTC_NO_TURN === "true");
     if (noTurn && iceCandidateType(candidate) !== "host") {
       return false;
     }
