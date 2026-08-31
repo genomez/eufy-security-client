@@ -1,6 +1,10 @@
 import { EventEmitter } from "events";
 
-import { connectAndWaitForRtcSession, StationRtcTransport } from "../stationRtcTransport";
+import {
+  connectAndWaitForRtcSession,
+  runWithHandoffTerminalTimeout,
+  StationRtcTransport,
+} from "../stationRtcTransport";
 import { RtcSession } from "../rtcSession";
 
 class FakeRtcSession extends EventEmitter {
@@ -58,6 +62,38 @@ describe("connectAndWaitForRtcSession", () => {
   });
 });
 
+describe("runWithHandoffTerminalTimeout", () => {
+  beforeEach(() => jest.useFakeTimers());
+  afterEach(() => jest.useRealTimers());
+
+  it("arms the outer watchdog before invoking a never-settling attempt", async () => {
+    const phases: string[] = [];
+    const onTimeout = jest.fn();
+    const attempt = jest.fn(() => new Promise<void>(() => undefined));
+    const result = expect(
+      runWithHandoffTerminalTimeout(attempt, 10_000, onTimeout, (phase) => phases.push(phase))
+    ).rejects.toThrow("T9000 RTC handoff outer timeout");
+
+    expect(phases.slice(0, 3)).toEqual(["outer_watchdog_armed", "outer_attempt_invoking", "outer_attempt_invoked"]);
+
+    jest.advanceTimersByTime(10_000);
+
+    await result;
+    expect(onTimeout).toHaveBeenCalledTimes(1);
+    expect(phases).toContain("outer_watchdog_fired");
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it("clears the outer watchdog when the attempt settles", async () => {
+    const onTimeout = jest.fn();
+
+    await expect(runWithHandoffTerminalTimeout(async () => "connected", 10_000, onTimeout)).resolves.toBe("connected");
+
+    expect(onTimeout).not.toHaveBeenCalled();
+    expect(jest.getTimerCount()).toBe(0);
+  });
+});
+
 describe("StationRtcTransport handoff failure", () => {
   beforeEach(() => jest.useFakeTimers());
   afterEach(() => jest.useRealTimers());
@@ -89,5 +125,35 @@ describe("StationRtcTransport handoff failure", () => {
     expect(replacement.close).toHaveBeenCalledTimes(1);
     expect(jest.getTimerCount()).toBe(0);
     jest.runOnlyPendingTimers();
+  });
+
+  it("keeps the working session when the external handoff watchdog fires", async () => {
+    const oldSession = new FakeRtcSession(async () => undefined);
+    const replacement = new FakeRtcSession(() => new Promise<void>(() => undefined));
+    const transport = new StationRtcTransport(
+      "station",
+      "admin",
+      { authToken: "test", userId: "user", region: "US" },
+      10_000
+    );
+    const internal = transport as unknown as {
+      connected: boolean;
+      handoffInProgress: boolean;
+      session: RtcSession;
+      createSession: () => RtcSession;
+    };
+    internal.connected = true;
+    internal.session = asRtcSession(oldSession);
+    internal.createSession = () => asRtcSession(replacement);
+
+    const handoff = expect(transport.handoffConnect()).resolves.toBe(false);
+    jest.advanceTimersByTime(10_000);
+
+    await handoff;
+    expect(internal.session).toBe(asRtcSession(oldSession));
+    expect(internal.handoffInProgress).toBe(false);
+    expect(oldSession.close).not.toHaveBeenCalled();
+    expect(replacement.close).toHaveBeenCalledTimes(1);
+    expect(jest.getTimerCount()).toBe(0);
   });
 });
