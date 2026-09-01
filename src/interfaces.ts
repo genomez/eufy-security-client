@@ -170,6 +170,7 @@ export interface EufySecurityEvents {
   "connection error": (error: Error) => void;
   "tfa request": () => void;
   "captcha request": (id: string, captcha: string) => void;
+  "mega auth recovery required": () => void;
   "persistent data": (data: string) => void;
   "mqtt connect": () => void;
   "mqtt close": () => void;
