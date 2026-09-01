@@ -1,5 +1,6 @@
 import { MegaHTTPApi, megaLoginHash, type MegaSession } from "../megaApi";
 import { megaEncryptBody, sharedKeyToAesKey, type MegaIdentity } from "../megaCrypto";
+import { rootHTTPLogger } from "../../logging";
 
 jest.mock("../../logging", () => ({
   rootHTTPLogger: { error: jest.fn(), debug: jest.fn(), info: jest.fn(), warn: jest.fn() },
@@ -215,6 +216,15 @@ describe("MegaHTTPApi", () => {
       expect(req.headers.gtoken).toMatch(/^[0-9a-f]{32}$/);
       expect(req.headers["x-auth-token"]).toBe("authtok");
       expect(req.headers.authorization).toBe("authtok");
+
+      expect(rootHTTPLogger.debug).toHaveBeenCalledWith("MegaApi request", {
+        host: "app-push-eu-pr.eufy.com",
+        path: "/app/push/register_push_token",
+        osType: "android",
+      });
+      expect(JSON.stringify((rootHTTPLogger.debug as jest.Mock).mock.calls)).not.toContain(
+        fakeIdentity().keyIdent
+      );
     });
   });
 
@@ -275,6 +285,9 @@ describe("MegaHTTPApi", () => {
       expect(res.code).toBe(0);
       expect(api.hasValidSession()).toBe(true);
       expect((api as any).authToken).toBe("FINAL");
+      expect(rootHTTPLogger.info).toHaveBeenCalledWith("MegaApi login ok");
+      expect(JSON.stringify((rootHTTPLogger.info as jest.Mock).mock.calls)).not.toContain("u9");
+      expect(JSON.stringify((rootHTTPLogger.info as jest.Mock).mock.calls)).not.toContain("FINAL");
     });
 
     it("returns 100032 (captcha required) without storing a token", async () => {
