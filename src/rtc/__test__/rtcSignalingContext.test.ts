@@ -12,6 +12,7 @@ describe("RtcSignalingClient regional signaling context", () => {
   });
 
   it("uses the EU host and web portal headers for FR", async () => {
+    const phases: string[] = [];
     const fetchMock = jest.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: true,
       status: 200,
@@ -24,7 +25,7 @@ describe("RtcSignalingClient regional signaling context", () => {
       region: "FR",
     });
 
-    await expect(client.fetchSign()).resolves.toBe("sign-value");
+    await expect(client.fetchSign({ reportPhase: (phase) => phases.push(phase) })).resolves.toBe("sign-value");
 
     expect(fetchMock).toHaveBeenCalledWith("https://security-smart-eu.eufylife.com/v1/smart/nvr/ws/sign", {
       headers: {
@@ -40,6 +41,47 @@ describe("RtcSignalingClient regional signaling context", () => {
     expect(headers).not.toHaveProperty("Country");
     expect(headers).not.toHaveProperty("Language");
     expect(headers).not.toHaveProperty("X-Auth-User");
+    expect(phases).toEqual([
+      "fetch_sign_request_dispatching",
+      "fetch_sign_request_dispatched",
+      "fetch_sign_response_headers",
+      "fetch_sign_body_read_start",
+      "fetch_sign_body_read_complete",
+    ]);
+  });
+
+  it("reports and rejects an explicitly aborted sign request", async () => {
+    const phases: string[] = [];
+    const abortController = new AbortController();
+    jest.spyOn(globalThis, "fetch").mockImplementation((_url, init) => {
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        signal?.addEventListener(
+          "abort",
+          () => reject(signal.reason instanceof Error ? signal.reason : new Error("aborted")),
+          { once: true }
+        );
+      });
+    });
+    const client = new RtcSignalingClient({
+      authToken: "test-auth-token",
+      gtoken: "test-gtoken",
+      stationSn: "station",
+      region: "FR",
+    });
+    const request = client.fetchSign({
+      signal: abortController.signal,
+      reportPhase: (phase) => phases.push(phase),
+    });
+
+    abortController.abort(new Error("test sign abort"));
+
+    await expect(request).rejects.toThrow("test sign abort");
+    expect(phases).toEqual([
+      "fetch_sign_request_dispatching",
+      "fetch_sign_request_dispatched",
+      "fetch_sign_request_aborted",
+    ]);
   });
 
   it("retains the current default host outside the isolated FR test", () => {

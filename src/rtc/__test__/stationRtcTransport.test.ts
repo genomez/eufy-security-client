@@ -92,6 +92,29 @@ describe("runWithHandoffTerminalTimeout", () => {
     expect(onTimeout).not.toHaveBeenCalled();
     expect(jest.getTimerCount()).toBe(0);
   });
+
+  it("rejects and runs cleanup when an external deadline aborts the attempt", async () => {
+    const phases: string[] = [];
+    const onTimeout = jest.fn();
+    const abortController = new AbortController();
+    const result = expect(
+      runWithHandoffTerminalTimeout(
+        () => new Promise<void>(() => undefined),
+        45_000,
+        onTimeout,
+        (phase) => phases.push(phase),
+        abortController.signal
+      )
+    ).rejects.toThrow("station deadline");
+
+    abortController.abort(new Error("station deadline"));
+
+    await result;
+    expect(onTimeout).toHaveBeenCalledTimes(1);
+    expect(phases).toContain("outer_external_abort_armed");
+    expect(phases).toContain("outer_external_abort_received");
+    expect(jest.getTimerCount()).toBe(0);
+  });
 });
 
 describe("StationRtcTransport handoff failure", () => {
@@ -148,6 +171,37 @@ describe("StationRtcTransport handoff failure", () => {
 
     const handoff = expect(transport.handoffConnect()).resolves.toBe(false);
     jest.advanceTimersByTime(10_000);
+
+    await handoff;
+    expect(internal.session).toBe(asRtcSession(oldSession));
+    expect(internal.handoffInProgress).toBe(false);
+    expect(oldSession.close).not.toHaveBeenCalled();
+    expect(replacement.close).toHaveBeenCalledTimes(1);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it("keeps the working session when the station-level abort signal fires", async () => {
+    const oldSession = new FakeRtcSession(async () => undefined);
+    const replacement = new FakeRtcSession(() => new Promise<void>(() => undefined));
+    const transport = new StationRtcTransport(
+      "station",
+      "admin",
+      { authToken: "test", userId: "user", region: "US" },
+      45_000
+    );
+    const internal = transport as unknown as {
+      connected: boolean;
+      handoffInProgress: boolean;
+      session: RtcSession;
+      createSession: () => RtcSession;
+    };
+    internal.connected = true;
+    internal.session = asRtcSession(oldSession);
+    internal.createSession = () => asRtcSession(replacement);
+    const abortController = new AbortController();
+
+    const handoff = expect(transport.handoffConnect(abortController.signal)).resolves.toBe(false);
+    abortController.abort(new Error("station deadline"));
 
     await handoff;
     expect(internal.session).toBe(asRtcSession(oldSession));
