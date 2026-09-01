@@ -197,7 +197,7 @@ export class MegaHTTPApi {
       headers.authorization = this.authToken;
     }
 
-    rootHTTPLogger.debug("MegaApi request", { host, path, osType: this.osType, keyIdent });
+    rootHTTPLogger.debug("MegaApi request", { host, path, osType: this.osType });
 
     const send = this.throttle(async () => {
       return await this.got(`https://${host}${path}`, {
@@ -282,7 +282,7 @@ export class MegaHTTPApi {
     const serverPubEnc = (result.data as { server_public_key: string }).server_public_key;
     const identity = finalizeKeyExchange(ecdh, serverPubEnc, keyIdent, clientPublicKey);
     this.identities.set(openapiHost, identity);
-    rootHTTPLogger.info("MegaApi key/exchange ok", { openapiHost, keyIdent });
+    rootHTTPLogger.info("MegaApi key/exchange ok", { openapiHost });
     return identity;
   }
 
@@ -465,7 +465,7 @@ export class MegaHTTPApi {
     const identity = this.identities.get(openapiHost)!;
     const decoded = JSON.parse(this.decryptForCluster(identity, result.data as string)) as { login_id: string };
     this.loginId = decoded.login_id;
-    rootHTTPLogger.info("MegaApi get_login_id", { loginId: this.loginId });
+    rootHTTPLogger.info("MegaApi get_login_id ok");
     return this.loginId;
   }
 
@@ -522,7 +522,7 @@ export class MegaHTTPApi {
         rootHTTPLogger.info("MegaApi login needs 2FA (token stored for verify_code)", { step: faInfo.step });
         return { ...result, code: ResponseErrorCode.CODE_NEED_VERIFY_CODE, msg: "2FA verify code required" };
       }
-      rootHTTPLogger.info("MegaApi login ok", { userId, keys: Object.keys(decoded) });
+      rootHTTPLogger.info("MegaApi login ok");
     }
     return result;
   }
