@@ -1,4 +1,14 @@
-import { GuardedMegaAuthRecovery, MegaAuthRecoveryDependencies } from "../megaAuthRecovery";
+import { GuardedMegaAuthRecovery, isMegaAuthRecoveryEnabled, MegaAuthRecoveryDependencies } from "../megaAuthRecovery";
+
+describe("Mega auth recovery configuration", () => {
+  it("defaults on but accepts an explicit fail-closed disable", () => {
+    expect(isMegaAuthRecoveryEnabled(undefined)).toBe(true);
+    expect(isMegaAuthRecoveryEnabled("1")).toBe(true);
+    expect(isMegaAuthRecoveryEnabled("0")).toBe(false);
+    expect(isMegaAuthRecoveryEnabled("false")).toBe(false);
+    expect(isMegaAuthRecoveryEnabled("FALSE")).toBe(false);
+  });
+});
 
 function dependencies(overrides: Partial<MegaAuthRecoveryDependencies> = {}): MegaAuthRecoveryDependencies {
   return {

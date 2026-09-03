@@ -25,7 +25,7 @@ import {
 import { Station } from "./http/station";
 import { HUB_FIRST_CLOUD_REFRESH_DELAY_MS } from "./http/hubAuthoritative";
 import { EventImageCache } from "./http/eventImageCache";
-import { GuardedMegaAuthRecovery, MegaAuthRecoveryResult } from "./http/megaAuthRecovery";
+import { GuardedMegaAuthRecovery, isMegaAuthRecoveryEnabled, MegaAuthRecoveryResult } from "./http/megaAuthRecovery";
 import { ConfirmInvite, DeviceListResponse, HouseInviteListResponse, Invite, StationListResponse } from "./http/models";
 import {
   CommandName,
@@ -982,9 +982,7 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
                 this.onStorageInfoHb3(station, channel, storageInfo)
               );
               station.on("hub notify update", (station: Station) => this.onHubNotifyUpdate(station));
-              station.on("push notification", (_station: Station, message: PushMessage) =>
-                this.onPushMessage(message)
-              );
+              station.on("push notification", (_station: Station, message: PushMessage) => this.onPushMessage(message));
               station.on(
                 "device video state",
                 (
@@ -1159,11 +1157,14 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
       );
     }
     this.floodlightPollInitialTimeouts.set(stationSN, initialTimeouts);
-    this.floodlightPollInterval[stationSN] = setInterval(() => {
-      if (station.isConnected()) {
-        this.pollFloodlightStates(station);
-      }
-    }, this.FLOODLIGHT_POLL_INTERVAL_MIN * 60 * 1000);
+    this.floodlightPollInterval[stationSN] = setInterval(
+      () => {
+        if (station.isConnected()) {
+          this.pollFloodlightStates(station);
+        }
+      },
+      this.FLOODLIGHT_POLL_INTERVAL_MIN * 60 * 1000
+    );
   }
 
   private clearFloodlightPoll(stationSN: string): void {
@@ -1902,6 +1903,12 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
   }
 
   private configureMegaAuthRecovery(): void {
+    if (!isMegaAuthRecoveryEnabled(process.env.RTC_MEGA_AUTH_RECOVERY_ENABLED)) {
+      this.megaAuthRecovery = undefined;
+      this.api.setMegaRtcAuthRecoveryHandler(undefined);
+      rootMainLogger.info("v6 RTC auth recovery disabled by configuration");
+      return;
+    }
     this.megaAuthRecovery = new GuardedMegaAuthRecovery({
       isRtcConnected: () =>
         Object.values(this.stations).some(
@@ -3174,18 +3181,18 @@ export class EufySecurity extends TypedEmitter<EufySecurityEvents> {
               !device.isLockWifiT8510P() &&
               !device.isLockWifiT8520P() &&
               !device.isLockWifiT85L0()) ||
-            (result.customData !== undefined &&
-              result.customData.property !== undefined &&
-              device.isSmartSafe() &&
-              result.command_type !== CommandType.CMD_SMARTSAFE_SETTINGS) ||
-            (result.customData !== undefined &&
-              result.customData.property !== undefined &&
-              (device.isLockWifiT8506() ||
-                device.isLockWifiT8502() ||
-                device.isLockWifiT8510P() ||
-                device.isLockWifiT8520P() ||
-                device.isLockWifiT85L0()) &&
-              result.command_type !== CommandType.CMD_DOORLOCK_SET_PUSH_MODE))
+              (result.customData !== undefined &&
+                result.customData.property !== undefined &&
+                device.isSmartSafe() &&
+                result.command_type !== CommandType.CMD_SMARTSAFE_SETTINGS) ||
+              (result.customData !== undefined &&
+                result.customData.property !== undefined &&
+                (device.isLockWifiT8506() ||
+                  device.isLockWifiT8502() ||
+                  device.isLockWifiT8510P() ||
+                  device.isLockWifiT8520P() ||
+                  device.isLockWifiT85L0()) &&
+                result.command_type !== CommandType.CMD_DOORLOCK_SET_PUSH_MODE))
           ) {
             if (device.hasProperty(result.customData.property.name)) {
               const metadata = device.getPropertyMetadata(result.customData.property.name);
