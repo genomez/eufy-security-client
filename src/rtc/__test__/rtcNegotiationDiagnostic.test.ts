@@ -1,9 +1,12 @@
 import {
   classifyRtcNegotiationStage,
+  getRtcAppLiveViewTestTiming,
   isNoHubSdpOfferTimeout,
+  isRtcAppLiveViewTestEnabled,
   RtcConnectTimeoutError,
   RtcNegotiationDiagnostic,
   shouldRunNoOfferCloudWakeRetry,
+  shouldRunRtcAppLiveViewTest,
 } from "../rtcSession";
 
 function diagnostic(overrides: Partial<RtcNegotiationDiagnostic> = {}): RtcNegotiationDiagnostic {
@@ -65,5 +68,30 @@ describe("RTC negotiation terminal classification", () => {
     expect(shouldRunNoOfferCloudWakeRetry(error, false, false)).toBe(false);
     expect(shouldRunNoOfferCloudWakeRetry(error, true, true)).toBe(false);
     expect(shouldRunNoOfferCloudWakeRetry(new Error("timeout"), true, false)).toBe(false);
+  });
+
+  it("gates the app live-view test behind opt-in, exact classification, and single-attempt state", () => {
+    const error = new RtcConnectTimeoutError(diagnostic({ scallAccepted: true, peerInitialized: true }));
+
+    expect(isRtcAppLiveViewTestEnabled("1")).toBe(true);
+    expect(isRtcAppLiveViewTestEnabled("TRUE")).toBe(true);
+    expect(isRtcAppLiveViewTestEnabled("0")).toBe(false);
+    expect(shouldRunRtcAppLiveViewTest(error, true, false)).toBe(true);
+    expect(shouldRunRtcAppLiveViewTest(error, false, false)).toBe(false);
+    expect(shouldRunRtcAppLiveViewTest(error, true, true)).toBe(false);
+    expect(shouldRunRtcAppLiveViewTest(new Error("timeout"), true, false)).toBe(false);
+  });
+
+  it("uses bounded app live-view timing defaults and overrides", () => {
+    expect(getRtcAppLiveViewTestTiming({})).toEqual({
+      prepareMs: 60_000,
+      activeMs: 30_000,
+      settleMs: 15_000,
+    });
+    expect(getRtcAppLiveViewTestTiming({ prepareMs: "1000", activeMs: "-1", settleMs: "999999" })).toEqual({
+      prepareMs: 1000,
+      activeMs: 0,
+      settleMs: 300_000,
+    });
   });
 });
