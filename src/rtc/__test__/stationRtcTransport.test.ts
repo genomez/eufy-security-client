@@ -90,4 +90,42 @@ describe("StationRtcTransport handoff failure", () => {
     expect(jest.getTimerCount()).toBe(0);
     jest.runOnlyPendingTimers();
   });
+
+  it("does not replace a newer primary when an older handoff fails late", async () => {
+    const oldSession = new FakeRtcSession(async () => undefined);
+    let rejectReplacement: ((error: Error) => void) | undefined;
+    const replacement = new FakeRtcSession(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectReplacement = reject;
+        })
+    );
+    const newerPrimary = new FakeRtcSession(async () => undefined);
+    const transport = new StationRtcTransport(
+      "station",
+      "admin",
+      { authToken: "test", userId: "user", region: "US" },
+      10_000
+    );
+    const internal = transport as unknown as {
+      connected: boolean;
+      session: RtcSession;
+      createSession: () => RtcSession;
+    };
+    internal.connected = true;
+    internal.session = asRtcSession(oldSession);
+    internal.createSession = () => asRtcSession(replacement);
+
+    const handoff = transport.handoffConnect();
+    await Promise.resolve();
+    internal.session = asRtcSession(newerPrimary);
+    rejectReplacement?.(new Error("late replacement failure"));
+
+    await expect(handoff).resolves.toBe(false);
+    expect(internal.session).toBe(asRtcSession(newerPrimary));
+    expect(oldSession.close).not.toHaveBeenCalled();
+    expect(newerPrimary.close).not.toHaveBeenCalled();
+    expect(replacement.close).toHaveBeenCalledTimes(1);
+    expect(jest.getTimerCount()).toBe(0);
+  });
 });
