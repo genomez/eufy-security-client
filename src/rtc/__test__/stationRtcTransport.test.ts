@@ -5,7 +5,7 @@ import {
   runWithHandoffTerminalTimeout,
   StationRtcTransport,
 } from "../stationRtcTransport";
-import { RtcSession } from "../rtcSession";
+import { RtcConnectTimeoutError, RtcNegotiationDiagnostic, RtcSession } from "../rtcSession";
 
 class FakeRtcSession extends EventEmitter {
   public readonly close = jest.fn();
@@ -16,6 +16,23 @@ class FakeRtcSession extends EventEmitter {
 
   public connect(): Promise<void> {
     return this.connectImpl();
+  }
+
+  public createConnectTimeoutError(): RtcConnectTimeoutError {
+    const diagnostic: RtcNegotiationDiagnostic = {
+      stage: "no_hub_sdp_offer",
+      connectionState: "connecting",
+      iceConnectionState: "new",
+      iceGatheringState: "new",
+      signalingState: "stable",
+      selectedPairPresent: false,
+      commandChannelOpen: false,
+      scallAccepted: true,
+      peerInitialized: true,
+      sdpHandled: false,
+      iceGatheringComplete: false,
+    };
+    return new RtcConnectTimeoutError(diagnostic);
   }
 }
 
@@ -59,6 +76,35 @@ describe("connectAndWaitForRtcSession", () => {
 
     expect(jest.getTimerCount()).toBe(0);
     expect(session.eventNames()).toEqual([]);
+  });
+});
+
+describe("StationRtcTransport initial connect classification", () => {
+  beforeEach(() => jest.useFakeTimers());
+  afterEach(() => jest.useRealTimers());
+
+  it("rejects a connect timeout with the session's sanitized negotiation stage", async () => {
+    const session = new FakeRtcSession(async () => undefined);
+    const transport = new StationRtcTransport(
+      "station",
+      "admin",
+      { authToken: "test", userId: "user", region: "US" },
+      10_000
+    );
+    const internal = transport as unknown as { createSession: () => RtcSession };
+    internal.createSession = () => asRtcSession(session);
+
+    const connection = transport.connect();
+    await Promise.resolve();
+    const result = expect(connection).rejects.toMatchObject({
+      name: "RtcConnectTimeoutError",
+      diagnostic: { stage: "no_hub_sdp_offer", selectedPairPresent: false },
+    });
+    jest.advanceTimersByTime(10_000);
+
+    await result;
+    expect(session.close).toHaveBeenCalledTimes(1);
+    expect(jest.getTimerCount()).toBe(0);
   });
 });
 
