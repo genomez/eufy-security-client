@@ -110,6 +110,27 @@ describe("RtcSignalingClient regional signaling context", () => {
     expect((error as Error).message).not.toContain("secret-auth-token");
   });
 
+  it("classifies the shorter token-not-exist sign response", async () => {
+    jest.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: false,
+      status: 401,
+      json: async () => ({ code: 401, msg: "token not exist" }),
+    } as Response);
+    const client = new RtcSignalingClient({
+      authToken: "secret-auth-token",
+      gtoken: "secret-gtoken",
+      stationSn: "station",
+      region: "FR",
+    });
+
+    const error = await client.fetchSign().catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(RtcSignalingFetchError);
+    expect(isRevokedMegaTokenSignError(error)).toBe(true);
+    expect((error as Error).message).toBe("RtcSignaling fetchSign failed: HTTP 401 revoked mega token");
+    expect((error as Error).message).not.toContain("secret-auth-token");
+  });
+
   it("does not classify an unrelated HTTP 401 as a revoked Mega token", async () => {
     jest.spyOn(globalThis, "fetch").mockResolvedValue({
       ok: false,
