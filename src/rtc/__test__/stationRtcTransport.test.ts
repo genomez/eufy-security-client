@@ -128,4 +128,34 @@ describe("StationRtcTransport handoff failure", () => {
     expect(replacement.close).toHaveBeenCalledTimes(1);
     expect(jest.getTimerCount()).toBe(0);
   });
+
+  it("honors a shorter caller-provided handoff deadline", async () => {
+    const oldSession = new FakeRtcSession(async () => undefined);
+    const replacement = new FakeRtcSession(() => new Promise<void>(() => undefined));
+    const transport = new StationRtcTransport(
+      "station",
+      "admin",
+      { authToken: "test", userId: "user", region: "US" },
+      10_000
+    );
+    const internal = transport as unknown as {
+      connected: boolean;
+      session: RtcSession;
+      createSession: () => RtcSession;
+    };
+    internal.connected = true;
+    internal.session = asRtcSession(oldSession);
+    internal.createSession = () => asRtcSession(replacement);
+
+    const handoff = expect(transport.handoffConnect(5_000)).resolves.toBe(false);
+    jest.advanceTimersByTime(4_999);
+    expect(replacement.close).not.toHaveBeenCalled();
+    jest.advanceTimersByTime(1);
+    await handoff;
+
+    expect(internal.session).toBe(asRtcSession(oldSession));
+    expect(oldSession.close).not.toHaveBeenCalled();
+    expect(replacement.close).toHaveBeenCalledTimes(1);
+    expect(jest.getTimerCount()).toBe(0);
+  });
 });

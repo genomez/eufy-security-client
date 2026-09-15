@@ -165,7 +165,7 @@ export class StationRtcTransport extends EventEmitter {
    * hub's ~337s command-path cliff forces a refresh. Returns false if handoff fails (caller
    * may fall back to hard close).
    */
-  public async handoffConnect(): Promise<boolean> {
+  public async handoffConnect(timeoutMs = this.connectTimeoutMs): Promise<boolean> {
     if (!this.credentials.authToken || !this.credentials.userId) {
       return false;
     }
@@ -188,9 +188,13 @@ export class StationRtcTransport extends EventEmitter {
     const oldSession = this.session;
     const startedAt = Date.now();
     const newSession = this.createSession();
+    const boundedTimeoutMs = Number.isFinite(timeoutMs)
+      ? Math.max(1_000, Math.min(this.connectTimeoutMs, Math.floor(timeoutMs)))
+      : this.connectTimeoutMs;
 
     rootHTTPLogger.info("StationRtcTransport handoff starting — second session while first stays up", {
       stationSn: this.stationSn,
+      timeoutMs: boundedTimeoutMs,
     });
 
     newSession.on("commandData", (data, linkType) => {
@@ -198,7 +202,7 @@ export class StationRtcTransport extends EventEmitter {
     });
 
     try {
-      await connectAndWaitForRtcSession(newSession, this.connectTimeoutMs);
+      await connectAndWaitForRtcSession(newSession, boundedTimeoutMs);
 
       // Swap before retiring old so sendCommand uses the new channel immediately.
       this.session = newSession;
@@ -241,13 +245,10 @@ export class StationRtcTransport extends EventEmitter {
         this.session = oldSession;
         this.wirePrimarySession(oldSession);
       } else if (this.session !== oldSession) {
-        rootHTTPLogger.info(
-          "StationRtcTransport handoff cleanup preserved newer primary session",
-          {
-            stationSn: this.stationSn,
-            hasPrimarySession: this.session !== undefined,
-          },
-        );
+        rootHTTPLogger.info("StationRtcTransport handoff cleanup preserved newer primary session", {
+          stationSn: this.stationSn,
+          hasPrimarySession: this.session !== undefined,
+        });
       }
       this.handoffInProgress = false;
       this.retiringSession = false;
